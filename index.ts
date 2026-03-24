@@ -36,6 +36,7 @@ function getSandboxApi(): SandboxApi | null {
 
 const PROVIDER_ID = "claude-code-acp";
 const MCP_SERVER_NAME = "pi-tools";
+const MAX_CONTEXT_MESSAGES = 20;
 
 const LATEST_MODEL_IDS = new Set(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]);
 
@@ -807,7 +808,8 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 					await connection.setSessionMode({ sessionId, modeId: "bypassPermissions" });
 					await connection.unstable_setSessionModel({ sessionId, modelId: model.id });
 					activeModelId = model.id;
-					promptText = buildPromptText(context);
+					const recent = context.messages.slice(-MAX_CONTEXT_MESSAGES);
+					promptText = buildPromptText({ ...context, messages: recent });
 					lastContextLength = context.messages.length;
 				} else {
 					// Continuation — ACP already has prior context
@@ -817,7 +819,15 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 						activeModelId = model.id;
 					}
 					const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
-					promptText = lastUser ? messageContentToText(lastUser.content) || "" : "";
+					const lastUserText = lastUser ? messageContentToText(lastUser.content) || "" : "";
+					const missed = context.messages.slice(lastContextLength, -1); // exclude latest user message
+					if (missed.length > 0) {
+						// Messages added by another provider — send catch-up + current prompt
+						const catchUp = buildPromptText({ ...context, messages: missed.slice(-MAX_CONTEXT_MESSAGES) });
+						promptText = `[The following exchanges already happened with another model while you were away. Do not respond to them — they are context only.]\n\n${catchUp}\n\n[End of prior context. Respond to the following message:]\n${lastUserText}`;
+					} else {
+						promptText = lastUserText;
+					}
 					lastContextLength = context.messages.length;
 				}
 

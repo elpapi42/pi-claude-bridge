@@ -68,7 +68,7 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
 
 **Claude Code loads its own skills** from `~/.claude/skills/` and `.claude/skills/` in addition to the pi skills we forward. These are additive — Claude Code may have skills pi doesn't know about.
 
-**Provider loses context after switching away and back.** The provider's continuation path only sends the latest user message, assuming ACP still has prior context. If you switch to another provider, have a conversation, and switch back, the ACP session misses everything that happened in between. The fix is to detect the context gap (compare `context.messages.length` to `lastContextLength`) and resend the full context or create a fresh session.
+**Provider context is capped at 20 messages.** When switching to claude-code-acp or on first use, only the last 20 messages are sent (includes tool results, so roughly 3-5 full exchanges). Older context is lost. Switching away to another provider and back sends the missed messages as catch-up context (also capped at 20).
 
 See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of available ACP `_meta` options.
 
