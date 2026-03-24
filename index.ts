@@ -3,11 +3,10 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION, type SessionNotification, type SessionUpdate, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type ReadTextFileRequest, type ReadTextFileResponse, type WriteTextFileRequest, type WriteTextFileResponse, type CreateTerminalRequest, type CreateTerminalResponse, type TerminalOutputRequest, type TerminalOutputResponse, type WaitForTerminalExitRequest, type WaitForTerminalExitResponse, type KillTerminalRequest, type KillTerminalResponse, type ReleaseTerminalRequest, type ReleaseTerminalResponse } from "@agentclientprotocol/sdk";
 import { Text } from "@mariozechner/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
-import { relative } from "node:path";
 import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { Writable, Readable } from "node:stream";
 
 const PROVIDER_ID = "claude-code-acp";
@@ -440,9 +439,8 @@ async function ensureConnection(): Promise<ClientSideConnection> {
 	});
 	acpProcess = child;
 
-	child.stderr?.on("data", (chunk: Buffer) => {
-		// Forward stderr so MCP server debug logs are visible
-		process.stderr.write(chunk);
+	child.stderr?.on("data", () => {
+		// Suppress stderr noise from npx/agent startup
 	});
 
 	child.on("close", () => {
@@ -573,10 +571,6 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 		try {
 			const connection = await ensureConnection();
 			const { customTools } = partitionTools(context.tools);
-			if (context.tools) {
-				console.error(`[claude-code-acp] tools: [${context.tools.map(t => t.name).join(", ")}]`);
-				console.error(`[claude-code-acp] custom: [${customTools.map(t => t.name).join(", ")}]`);
-			}
 
 			// --- Mode B: Resume with tool result ---
 			if (activePromise && pendingToolCall) {
@@ -604,8 +598,6 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 						const port = await ensureBridgeServer();
 						const bridgeUrl = `http://127.0.0.1:${port}`;
 						const scriptPath = await ensureMcpServerScript(customTools, bridgeUrl);
-						console.error(`[claude-code-acp] MCP server script: ${scriptPath}`);
-						console.error(`[claude-code-acp] Bridge URL: ${bridgeUrl}`);
 						mcpServers.push({
 							command: "node",
 							args: [scriptPath],
@@ -622,11 +614,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 							},
 						};
 					}
-					console.error(`[claude-code-acp] newSession mcpServers: ${JSON.stringify(mcpServers)}`);
-					console.error(`[claude-code-acp] newSession _meta: ${JSON.stringify(_meta)}`);
 					const session = await connection.newSession({ cwd: process.cwd(), mcpServers, _meta } as any);
-					console.error(`[claude-code-acp] session created: ${session.sessionId}`);
-					console.error(`[claude-code-acp] session response: ${JSON.stringify(session)}`);
 
 					sessionId = session.sessionId;
 					activeSessionId = sessionId;
