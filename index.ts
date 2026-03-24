@@ -11,6 +11,29 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable, Readable } from "node:stream";
 
+// Gondolin sandbox integration (pi-my-stuff/sandbox/).
+// When the Gondolin VM is running, AskClaude spawns the ACP process inside the
+// VM so Claude Code's tools (bash, read, write) execute in the sandbox.
+// Types are inlined to avoid a hard import — if the sandbox extension isn't
+// loaded, getSandboxApi() returns null and we fall back to host execution.
+interface SandboxProcess {
+	write(data: string | Buffer): void;
+	end(): void;
+	stdout: Readable;
+	stderr: Readable | null;
+	result: Promise<{ exitCode: number }>;
+	kill(): void;
+}
+
+interface SandboxApi {
+	isActive(): boolean;
+	spawnProcess(command: string[], options?: { cwd?: string; env?: Record<string, string> }): SandboxProcess;
+}
+
+function getSandboxApi(): SandboxApi | null {
+	return (globalThis as Record<string, unknown>).__pi_sandbox_api__ as SandboxApi ?? null;
+}
+
 const PROVIDER_ID = "claude-code-acp";
 const MCP_SERVER_NAME = "pi-tools";
 
@@ -364,6 +387,21 @@ let activePromise: Promise<PromptResponse> | null = null;
 let lastContextLength = 0;
 let hadToolUseCycles = false;
 
+// --- Sandbox ACP connection (for AskClaude when sandbox is running) ---
+
+let sandboxAcpProcess: SandboxProcess | null = null;
+let sandboxAcpConnection: ClientSideConnection | null = null;
+let sandboxSessionUpdateHandler: ((update: SessionUpdate) => void) | null = null;
+
+function killSandboxConnection() {
+	if (sandboxAcpProcess) {
+		sandboxAcpProcess.kill();
+		sandboxAcpProcess = null;
+	}
+	sandboxAcpConnection = null;
+	sandboxSessionUpdateHandler = null;
+}
+
 function killConnection() {
 	if (acpProcess) {
 		acpProcess.kill();
@@ -475,8 +513,97 @@ async function ensureConnection(): Promise<ClientSideConnection> {
 	return connection;
 }
 
-process.on("exit", () => killConnection());
-process.on("SIGTERM", () => killConnection());
+process.on("exit", () => { killConnection(); killSandboxConnection(); });
+process.on("SIGTERM", () => { killConnection(); killSandboxConnection(); });
+
+// --- Sandbox ACP connection ---
+
+async function ensureSandboxAcpConnection(): Promise<ClientSideConnection | null> {
+	if (sandboxAcpConnection) return sandboxAcpConnection;
+
+	const sandbox = getSandboxApi();
+	if (!sandbox?.isActive()) return null;
+
+	const proc = sandbox.spawnProcess(["claude-agent-acp"], { cwd: "/workspace" });
+	sandboxAcpProcess = proc;
+
+	let stderrBuffer = "";
+	proc.stderr?.on("data", (chunk: Buffer) => { stderrBuffer += chunk.toString(); });
+
+	proc.result.then(({ exitCode }) => {
+		if (exitCode !== 0 && stderrBuffer.trim()) {
+			console.error(`[claude-code-acp] Sandbox ACP process exited ${exitCode}:\n${stderrBuffer.trim()}`);
+		}
+		sandboxAcpProcess = null;
+		killSandboxConnection();
+	});
+
+	// Wrap Gondolin ExecProcess stdin (write/end) as a Node.js Writable for ndJsonStream
+	const stdinWritable = new Writable({
+		write(chunk, _encoding, callback) {
+			try { proc.write(chunk); callback(); }
+			catch (err) { callback(err as Error); }
+		},
+		final(callback) {
+			try { proc.end(); callback(); }
+			catch (err) { callback(err as Error); }
+		},
+	});
+
+	const input = Writable.toWeb(stdinWritable) as WritableStream<Uint8Array>;
+	const output = Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array>;
+	const rawStream = ndJsonStream(input, output);
+
+	// Intercept session/update notifications (same pattern as host connection)
+	const filter = new TransformStream({
+		transform(msg: any, controller) {
+			if ("method" in msg && msg.method === "session/update" && !("id" in msg) && msg.params) {
+				try {
+					const update = (msg.params as SessionNotification).update;
+					sandboxSessionUpdateHandler?.(update);
+				} catch (e) {
+					console.error("[claude-code-acp] sandbox session/update handler error:", e);
+				}
+				return;
+			}
+			controller.enqueue(msg);
+		},
+	});
+	rawStream.readable.pipeTo(filter.writable).catch(() => {});
+	const stream = { readable: filter.readable, writable: rawStream.writable };
+
+	const connection = new ClientSideConnection(
+		() => ({
+			sessionUpdate: async () => {},
+			requestPermission: async (params) => {
+				const opt = params.options.find((o) => o.kind === "allow_once" || o.kind === "allow_always");
+				return opt
+					? { outcome: { outcome: "selected", optionId: opt.optionId } }
+					: { outcome: { outcome: "cancelled" } };
+			},
+			readTextFile: async () => ({ content: "" }),
+			writeTextFile: async () => ({}),
+			createTerminal: async () => ({ terminalId: "stub" }),
+			terminalOutput: async () => ({ output: "", truncated: false }),
+			waitForTerminalExit: async () => ({ exitCode: 1 }),
+			killTerminal: async () => {},
+			releaseTerminal: async () => {},
+		}),
+		stream,
+	);
+
+	await connection.initialize({
+		protocolVersion: PROTOCOL_VERSION,
+		clientCapabilities: {
+			fs: { readTextFile: true, writeTextFile: true },
+			terminal: true,
+		},
+		clientInfo: { name: "pi-claude-code-acp-sandbox", version: "0.1.0" },
+	});
+
+	sandboxAcpConnection = connection;
+	return connection;
+}
 
 // --- AskClaude: prompt and wait ---
 
@@ -487,7 +614,10 @@ async function promptAndWait(
 	signal?: AbortSignal,
 	options?: { systemPrompt?: string; appendSkills?: boolean; onStreamUpdate?: (responseText: string) => void },
 ): Promise<{ responseText: string; stopReason: string }> {
-	const connection = await ensureConnection();
+	// Use sandbox ACP connection when available (Claude Code runs inside the VM)
+	const sandboxConn = await ensureSandboxAcpConnection();
+	const useSandbox = sandboxConn !== null;
+	const connection = sandboxConn ?? await ensureConnection();
 
 	// Build _meta: mode preset + skills append + MCP suppression
 	const modePreset = MODE_PRESETS[mode] ?? {};
@@ -506,7 +636,7 @@ async function promptAndWait(
 	};
 
 	const session = await connection.newSession({
-		cwd: process.cwd(),
+		cwd: useSandbox ? "/workspace" : process.cwd(),
 		mcpServers: [],
 		_meta: meta,
 	} as any);
@@ -515,7 +645,7 @@ async function promptAndWait(
 
 	let responseText = "";
 
-	sessionUpdateHandler = (update: SessionUpdate) => {
+	const handler = (update: SessionUpdate) => {
 		switch (update.sessionUpdate) {
 			case "agent_message_chunk": {
 				const content = update.content;
@@ -549,6 +679,9 @@ async function promptAndWait(
 		}
 	};
 
+	if (useSandbox) sandboxSessionUpdateHandler = handler;
+	else sessionUpdateHandler = handler;
+
 	const onAbort = () => connection.cancel({ sessionId: sid });
 	if (signal) {
 		if (signal.aborted) onAbort();
@@ -563,7 +696,8 @@ async function promptAndWait(
 		return { responseText, stopReason: result.stopReason };
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
-		sessionUpdateHandler = null;
+		if (useSandbox) sandboxSessionUpdateHandler = null;
+		else sessionUpdateHandler = null;
 		connection.unstable_closeSession({ sessionId: sid }).catch(() => {});
 	}
 }
@@ -862,6 +996,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		killConnection();
+		killSandboxConnection();
 	});
 
 	pi.registerProvider(PROVIDER_ID, {
