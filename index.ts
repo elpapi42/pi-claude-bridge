@@ -1,7 +1,9 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION, type SessionNotification, type SessionUpdate, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type ReadTextFileRequest, type ReadTextFileResponse, type WriteTextFileRequest, type WriteTextFileResponse, type CreateTerminalRequest, type CreateTerminalResponse, type TerminalOutputRequest, type TerminalOutputResponse, type WaitForTerminalExitRequest, type WaitForTerminalExitResponse, type KillTerminalRequest, type KillTerminalResponse, type ReleaseTerminalRequest, type ReleaseTerminalResponse } from "@agentclientprotocol/sdk";
+import { Text } from "@mariozechner/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
+import { relative } from "node:path";
 import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -12,6 +14,10 @@ const PROVIDER_ID = "claude-code-acp";
 
 const BUILTIN_TOOL_NAMES = new Set(["read", "write", "edit", "bash", "grep", "find", "glob"]);
 const MCP_SERVER_NAME = "pi-tools";
+const MSG_TOOL = "claude-acp-tool";
+
+let piApi: ExtensionAPI | null = null;
+const cwd = process.cwd();
 
 const LATEST_MODEL_IDS = new Set(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]);
 
@@ -695,10 +701,33 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 					}
 
 					case "tool_call":
-					case "tool_call_update":
-						// Built-in tools: ACP handles internally, ignore
-						// Custom tools: handled via MCP bridge (pendingToolCall)
+					case "tool_call_update": {
+						// Custom tools go through MCP bridge (pendingToolCall).
+						// Built-in tools: emit to Pi as context so other providers see what Claude did.
+						const tc = update as any;
+						if (tc.status === "completed" || tc.status === "failed") {
+							const title = tc.title ?? "tool";
+							const rawOutput = tc.rawOutput;
+							const outputText = rawOutput != null
+								? (typeof rawOutput === "string" ? rawOutput : JSON.stringify(rawOutput))
+								: "";
+							const loc = tc.locations?.[0]?.path;
+							const tcPath = loc ? relative(cwd, loc) || loc : undefined;
+							const content = outputText.length > 500
+								? outputText.slice(0, 500) + "..."
+								: outputText;
+							piApi?.sendMessage(
+								{
+									customType: MSG_TOOL,
+									content: content || title,
+									display: true,
+									details: { name: title, status: tc.status, path: tcPath, toolCallId: tc.toolCallId },
+								},
+								{ triggerTurn: false },
+							);
+						}
 						break;
+					}
 
 					case "usage_update": {
 						const usage = update as { used?: number; size?: number } & { sessionUpdate: string };
@@ -804,6 +833,24 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 // --- Provider registration ---
 
 export default function (pi: ExtensionAPI) {
+	piApi = pi;
+
+	pi.registerMessageRenderer(MSG_TOOL, (message, { expanded }, theme) => {
+		const details = message.details as { name?: string; status?: string; path?: string } | undefined;
+		const content = typeof message.content === "string" ? message.content : "";
+		const icon = details?.status === "completed"
+			? theme.fg("success", "\u2713")
+			: details?.status === "failed"
+				? theme.fg("error", "\u2717")
+				: theme.fg("warning", "\u25C9");
+		let text = `${icon} ${theme.fg("toolTitle", details?.name ?? "tool")}`;
+		if (details?.path) text += ` ${theme.fg("muted", details.path)}`;
+		if (expanded && content) {
+			text += `\n${theme.fg("toolOutput", content)}`;
+		}
+		return new Text(text, 0, 0);
+	});
+
 	pi.registerProvider(PROVIDER_ID, {
 		baseUrl: "claude-code-acp",
 		apiKey: "not-used",
