@@ -667,23 +667,16 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 				promptText = buildPromptText(context, systemPromptAppend);
 				lastContextLength = context.messages.length;
 			} else {
-				// Continuation — send only new messages
+				// Continuation — ACP already has prior context, just send latest user message
 				sessionId = activeSessionId;
-				// Update model if changed
 				if (activeModelId !== model.id) {
 					await connection.unstable_setSessionModel({ sessionId, modelId: model.id });
 					activeModelId = model.id;
 				}
-				const newMessages = context.messages.slice(lastContextLength);
-				if (newMessages.length > 0) {
-					promptText = buildPromptText({ ...context, messages: newMessages });
-				} else {
-					// Fallback: send the last user message
-					const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
-					promptText = lastUser
-						? messageContentToText(lastUser.content) || ""
-						: "";
-				}
+				const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+				promptText = lastUser
+					? messageContentToText(lastUser.content) || ""
+					: "";
 				lastContextLength = context.messages.length;
 			}
 
