@@ -679,7 +679,10 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 						mcpServers,
 						_meta: {
 							disableBuiltInTools: true,
-							claudeCode: { options: { allowedTools: [`mcp__${MCP_SERVER_NAME}__*`] } },
+							claudeCode: { options: {
+							allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
+							extraArgs: { "strict-mcp-config": null },
+						} },
 						},
 					} as any);
 

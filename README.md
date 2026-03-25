@@ -1,5 +1,7 @@
 # pi-claude-code-acp
 
+![screenshot](screenshot.png)
+
 Pi extension that integrates Claude Code via ACP (Agent Client Protocol). Provides two ways to use Claude Code from pi:
 
 1. **Provider** — Offers Opus/Sonnet/Haiku as models that can be selected in pi like usual
@@ -7,7 +9,9 @@ Pi extension that integrates Claude Code via ACP (Agent Client Protocol). Provid
 
 Behind the scenes, it is automating a real Claude Code session and using MCP to bridge tool calls from Claude Code back to Pi where they are executed.
 
-It a little janky, but actually mostly works! This was inspired by [claude-agent-sdk-pi](https://github.com/prateekmedia/claude-agent-sdk-pi) but the advantage over the Agent SDK approach and the built-in Claude Code emulation is that (I believe) this is a fully compliant way to use Claude Max/Pro subscriptions from Pi. It follows the rules: only the real Claude Code touches Anthropic's API and requests are part of a user-driven coding session.
+It a little janky, but actually mostly works! 
+
+This is a heavily reworked fork of [claude-agent-sdk-pi](https://github.com/prateekmedia/claude-agent-sdk-pi), which does a similar thing using the Agent SDK. The advantage of ACP over the Agent SDK or pi's built-in Claude Code emulation is that (I believe) the ACP approach is a fully compliant way to use Claude Max/Pro subscription. It follows the rules: only the real Claude Code touches Anthropic's API and requests are part of a user-driven coding session.
 
 (IANAL and obviously this extension is unofficial and neither endorsed nor supported by Anthropic.)
 
@@ -70,11 +74,9 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
 
 **AskClaude has no shared conversation history.** Each call creates a fresh Claude Code session. The calling LLM must pack relevant context into the prompt string. Persistent sessions are planned (see TODOs).
 
-**MCP suppression is untested.** `--strict-mcp-config` is passed via `extraArgs` in `_meta` — this may not work through the ACP bridge. If MCP tools leak through, the fallback is explicit `allowedTools` in all modes.
-
 **Claude Code loads its own skills** from `~/.claude/skills/` and `.claude/skills/` in addition to the pi skills we forward. These are additive — Claude Code may have skills pi doesn't know about.
 
-**Provider context is capped at 20 messages.** When switching to claude-code-acp or on first use, only the last 20 messages are sent (includes tool results, so roughly 3-5 full exchanges). Older context is lost. Switching away to another provider and back sends the missed messages as catch-up context (also capped at 20).
+**Provider context awkward when switching to claude-code-acp provider** When switching to claude-code-acp from another model provider during a session, only the last 20 messages are sent (includes tool results, so roughly 3-5 full exchanges). The messages are also crammed into the first user prompt since there's no way to insert messages into Claude Code's history.
 
 See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of available ACP `_meta` options.
 
@@ -86,4 +88,3 @@ See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of
   - **displayOnly message**: `sendMessage` with `display: true` + `displayOnly` detail, filtered from LLM context via `on("context")`. Proven pattern from `extensions/claude-acp.ts`.
   - **Overlay**: `ctx.ui.custom()` with `{ overlay: true }` for a dismissible panel.
   - Stream progress into a widget during execution, clear on next user input via `on("input")`.
-- **Verify MCP suppression** — test that `extraArgs: { "strict-mcp-config": null }` actually prevents MCP server loading through ACP. If not, fall back to explicit `allowedTools` in all modes.

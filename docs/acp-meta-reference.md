@@ -99,7 +99,7 @@ _meta: {
 
 **Use case:** `strict-mcp-config` prevents Claude Code from loading MCP servers from user/project config files, reducing token overhead from unwanted tool schemas.
 
-**Caveat:** Not all CLI args may be effective when passed this way — the ACP adapter may not forward all args. Needs testing.
+**Caveat:** Not all CLI args may be effective when passed this way — the ACP adapter may not forward all args. `strict-mcp-config` is confirmed working.
 
 ### `mcpServers`
 
@@ -136,8 +136,8 @@ These are part of the ACP protocol, not `_meta`:
 
 These Claude Agent SDK features have no known ACP equivalent:
 
-- **`settingSources`** — controls which `.claude` config dirs are loaded. May work via `extraArgs: { "setting-sources": "user" }` but untested.
-- **`strictMcpConfig`** — may work via `extraArgs: { "strict-mcp-config": null }` but untested.
+- **`settingSources`** — controls which `.claude` config dirs are loaded. Likely works via `extraArgs: { "setting-sources": "user" }` (same mechanism as `strict-mcp-config`) but untested.
+- **`strictMcpConfig`** — works via `extraArgs: { "strict-mcp-config": null }`. Confirmed working.
 - **`permissionMode`** — ACP uses `setSessionMode` instead (e.g., `modeId: "bypassPermissions"`).
 - **`canUseTool` callback** — no ACP equivalent for per-tool permission logic.
 - **`includePartialMessages`** — streaming is handled differently in ACP (session/update notifications).

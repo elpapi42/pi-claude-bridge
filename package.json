@@ -2,14 +2,14 @@
   "name": "pi-claude-code-acp",
   "version": "0.1.0",
   "private": false,
-  "description": "Claude LLM provider for pi.dev that works by connecting to Claude Code over ACP (Agent Client Protocol). It's a little janky, but works as a mostly normal provider and also offers an AskClaude tool that pi can call without switching models. I believe it is a compliant way to use a Claude subscription.",
+  "description": "Pi extension that uses Claude Code as a model provider and also adds an AskClaude tool. It works over ACP and so should be a compliant way to use a Claude Pro/Max subscription from within pi.",
   "keywords": [
     "pi-package",
     "pi",
     "extension",
     "claude-code",
     "acp",
-    "agent-client-protocol",
+    "agent-client-protocol"
   ],
   "author": "Eli Dickinson",
   "license": "MIT",
