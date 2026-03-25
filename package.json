@@ -1,8 +1,25 @@
 {
   "name": "pi-claude-code-acp",
   "version": "0.1.0",
+  "private": false,
+  "description": "Claude Code integration for pi via ACP (Agent Client Protocol) — provider and AskClaude tool",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi",
+    "extension",
+    "claude-code",
+    "acp",
+    "agent-client-protocol",
+    "ai",
+    "coding"
+  ],
+  "author": "",
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "docs/"
   ],
   "type": "module",
   "dependencies": {
