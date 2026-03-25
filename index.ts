@@ -137,8 +137,19 @@ function extractSkillsBlock(systemPrompt: string): string | undefined {
 
 const MODE_PRESETS: Record<string, Record<string, unknown>> = {
 	full: {},
-	read: { claudeCode: { options: { allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"] } } },
-	none: { disableBuiltInTools: true },
+	// disallowedTools works with bypassPermissions; allowedTools does not
+	read: { claudeCode: { options: { disallowedTools: [
+		"Write", "Edit", "Bash", "NotebookEdit",
+		"EnterWorktree", "ExitWorktree",
+		"CronCreate", "CronDelete",
+		"TeamCreate", "TeamDelete",
+	] } } },
+	none: { claudeCode: { options: { disallowedTools: [
+		"Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent",
+		"NotebookEdit", "EnterWorktree", "ExitWorktree",
+		"CronCreate", "CronDelete", "TeamCreate", "TeamDelete",
+		"WebFetch", "WebSearch",
+	] } } },
 };
 
 // --- Provider helpers ---
