@@ -585,20 +585,19 @@ async function promptAndWait(
 
 	sessionUpdateHandler = handler;
 
-	const onAbort = () => connection.cancel({ sessionId: sid });
-	if (signal) {
-		if (signal.aborted) onAbort();
-		else signal.addEventListener("abort", onAbort, { once: true });
-	}
+	// Race prompt against abort signal — cancel() alone can't guarantee prompt() resolves promptly
+	const onAbort = () => { connection.cancel({ sessionId: sid }).catch(() => {}); };
+	const abortP = signal ? new Promise<never>((_, reject) => {
+		const fire = () => { onAbort(); reject(new Error("Aborted")); };
+		if (signal.aborted) { fire(); return; }
+		signal.addEventListener("abort", fire, { once: true });
+	}) : null;
 
 	try {
-		const result = await connection.prompt({
-			sessionId: sid,
-			prompt: [{ type: "text", text: prompt }],
-		});
+		const promptP = connection.prompt({ sessionId: sid, prompt: [{ type: "text", text: prompt }] });
+		const result = abortP ? await Promise.race([promptP, abortP]) : await promptP;
 		return { responseText, stopReason: result.stopReason };
 	} finally {
-		signal?.removeEventListener("abort", onAbort);
 		sessionUpdateHandler = null;
 		connection.unstable_closeSession({ sessionId: sid }).catch(() => {});
 	}
