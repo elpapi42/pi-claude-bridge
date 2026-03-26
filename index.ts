@@ -429,7 +429,9 @@ async function ensureConnection(): Promise<ClientSideConnection> {
 
 	let stderrBuffer = "";
 	child.stderr?.on("data", (chunk: Buffer) => {
-		stderrBuffer += chunk.toString();
+		const text = chunk.toString();
+		stderrBuffer += text;
+		if (process.env.CLAUDE_ACP_DEBUG) console.error(`[claude-code-acp] stderr: ${text.trimEnd()}`);
 	});
 
 	child.on("close", (code) => {
@@ -944,6 +946,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 			}
 		} catch (error) {
 			activePromise = null;
+			console.error("[claude-code-acp] provider prompt error:", error);
 			if (!acpConnection || acpProcess === null) {
 				killConnection();
 			}
@@ -1100,6 +1103,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				} catch (err) {
 					clearInterval(progressInterval);
+					console.error("[claude-code-acp] AskClaude error:", err);
 					const msg = errorMessage(err);
 					return {
 						content: [{ type: "text" as const, text: `Error: ${msg}` }],

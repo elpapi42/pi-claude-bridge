@@ -82,6 +82,10 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
 - `"allowFullMode": true` — enable full mode (read + write + run). Off by default — AskClaude only offers read and none modes unless this is set.
 - `"appendSkills": false` — don't forward pi's skills to Claude Code
 
+## Debugging
+
+Set `CLAUDE_ACP_DEBUG=1` to stream the ACP child process's stderr in real-time. Useful for diagnosing opaque errors like "Internal error".
+
 ## Limitations
 
 **AskClaude has no shared conversation history.** Each call creates a fresh Claude Code session. The calling LLM must pack relevant context into the prompt string. Persistent sessions are planned (see TODOs).
