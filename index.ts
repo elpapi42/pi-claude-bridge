@@ -10,6 +10,7 @@ import { createServer, type Server } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable, Readable } from "node:stream";
+import { createSession, openSession, type Session } from "cc-session-io";
 
 /** Extract a useful message from any thrown value (Error, plain object, or primitive). */
 function errorMessage(err: unknown): string {
@@ -25,7 +26,9 @@ function errorMessage(err: unknown): string {
 
 const PROVIDER_ID = "claude-code-acp";
 const MCP_SERVER_NAME = "pi-tools";
-const MAX_CONTEXT_MESSAGES = 20;
+
+/** Max messages to seed into a Claude Code session JSONL. Keeps most recent, drops oldest. */
+const MAX_MIRROR_MESSAGES = 40;
 
 const LATEST_MODEL_IDS = new Set(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]);
 
@@ -158,29 +161,7 @@ function getToolsForMcp(tools?: Tool[], excludeName?: string): Tool[] {
 	return excludeName ? tools.filter(t => t.name !== excludeName) : tools;
 }
 
-// --- Prompt building ---
-
-function buildPromptText(context: Context): string {
-	const parts: string[] = [];
-
-	for (const message of context.messages) {
-		if (message.role === "user") {
-			const text = messageContentToText(message.content);
-			parts.push(`USER:\n${text || "(see attached image)"}`);
-		} else if (message.role === "assistant") {
-			const text = assistantContentToText(message.content);
-			if (text.length > 0) {
-				parts.push(`ASSISTANT:\n${text}`);
-			}
-		} else if (message.role === "toolResult") {
-			const header = `TOOL RESULT (historical ${message.toolName ?? "unknown"}):`;
-			const text = messageContentToText(message.content);
-			parts.push(`${header}\n${text || "(see attached image)"}`);
-		}
-	}
-
-	return parts.join("\n\n") || "";
-}
+// --- Text extraction helpers ---
 
 function messageContentToText(
 	content:
@@ -204,31 +185,6 @@ function messageContentToText(
 	return hasText ? textParts.join("\n") : "";
 }
 
-function assistantContentToText(
-	content:
-		| string
-		| Array<{
-			type: string;
-			text?: string;
-			thinking?: string;
-			name?: string;
-			arguments?: Record<string, unknown>;
-		}>,
-): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((block) => {
-			if (block.type === "text") return block.text ?? "";
-			if (block.type === "thinking") return block.thinking ?? "";
-			if (block.type === "toolCall") {
-				const args = block.arguments ? JSON.stringify(block.arguments) : "{}";
-				return `Historical tool call: ${block.name} args=${args}`;
-			}
-			return `[${block.type}]`;
-		})
-		.join("\n");
-}
 
 // --- HTTP bridge for MCP tool calls ---
 
@@ -379,6 +335,49 @@ function extractLastToolResult(context: Context): { toolName: string; content: s
 	return null;
 }
 
+// --- Session mirroring via cc-session ---
+
+let mirrorSessionId: string | null = null;
+let mirrorCursor: number = 0;
+
+/** Translate pi messages into cc-session records. */
+function mirrorPiMessages(session: Session, messages: Context["messages"]): void {
+	for (const msg of messages) {
+		if (msg.role === "user") {
+			const text = typeof msg.content === "string"
+				? msg.content
+				: messageContentToText(msg.content) || "[image]";
+			session.addUserMessage(text);
+		} else if (msg.role === "assistant") {
+			const blocks: Array<{ type: "text"; text: string } | { type: "thinking"; thinking: string; signature: string } | { type: "tool_use"; id: string; name: string; input: unknown }> = [];
+			if (typeof msg.content === "string") {
+				blocks.push({ type: "text", text: msg.content });
+			} else {
+				for (const block of msg.content) {
+					if (block.type === "text") {
+						blocks.push({ type: "text", text: block.text ?? "" });
+					} else if (block.type === "thinking") {
+						blocks.push({ type: "thinking", thinking: block.thinking ?? "", signature: "" });
+					} else if (block.type === "toolCall") {
+						blocks.push({ type: "tool_use", id: block.id, name: block.name, input: block.arguments ?? {} });
+					}
+				}
+			}
+			if (blocks.length > 0) {
+				session.addAssistantMessage(blocks);
+			}
+		} else if (msg.role === "toolResult") {
+			const content = messageContentToText(msg.content) || "";
+			session.addToolResults([{ toolUseId: msg.toolCallId, content, isError: msg.isError }]);
+		}
+	}
+}
+
+function resetMirror(): void {
+	mirrorSessionId = null;
+	mirrorCursor = 0;
+}
+
 // --- ACP connection management ---
 
 let acpProcess: ChildProcess | null = null;
@@ -387,7 +386,6 @@ let sessionUpdateHandler: ((update: SessionUpdate) => void) | null = null;
 let activeSessionId: string | null = null;
 let activeModelId: string | null = null;
 let activePromise: Promise<PromptResponse> | null = null;
-let lastContextLength = 0;
 let hadToolUseCycles = false;
 
 function killConnection() {
@@ -400,7 +398,6 @@ function killConnection() {
 	activeSessionId = null;
 	activeModelId = null;
 	activePromise = null;
-	lastContextLength = 0;
 	hadToolUseCycles = false;
 
 	if (pendingToolCall) {
@@ -433,8 +430,11 @@ async function ensureConnection(): Promise<ClientSideConnection> {
 	// exiting. Print mode (-p) doesn't emit session_shutdown, so without this
 	// the process hangs. Cleanup still happens via process.on("exit").
 	child.unref();
+	// @ts-expect-error — stdio are net.Socket at runtime which have unref(), but TS types them as Writable/Readable
 	child.stdin?.unref();
+	// @ts-expect-error
 	child.stdout?.unref();
+	// @ts-expect-error
 	child.stderr?.unref();
 
 	let stderrBuffer = "";
@@ -684,42 +684,57 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 				const toolResult = extractLastToolResult(context);
 				pendingToolCall.resolve(toolResult?.content || "OK");
 				pendingToolCall = null;
-				lastContextLength = context.messages.length;
+				mirrorCursor = context.messages.length;
 
 			// --- Mode A: Fresh prompt ---
 			} else {
 				hadToolUseCycles = false;
-				let promptText: string;
+				const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+				const lastUserText = lastUser ? messageContentToText(lastUser.content) || "" : "";
+
+				// MCP server setup (needed for both first activation and resume)
+				const mcpServers: Array<{ command: string; args: string[]; env: Array<{ name: string; value: string }>; name: string }> = [];
+				if (tools.length > 0) {
+					const port = await ensureBridgeServer();
+					const bridgeUrl = `http://127.0.0.1:${port}`;
+					const scriptPath = await writeMcpServerScript(tools, bridgeUrl);
+					mcpServers.push({ command: "node", args: [scriptPath], env: [], name: MCP_SERVER_NAME });
+				}
+
 				if (!activeSessionId) {
-					// First call — new session with full context
-					const mcpServers: Array<{ command: string; args: string[]; env: Array<{ name: string; value: string }>; name: string }> = [];
-					if (tools.length > 0) {
-						const port = await ensureBridgeServer();
-						const bridgeUrl = `http://127.0.0.1:${port}`;
-						const scriptPath = await writeMcpServerScript(tools, bridgeUrl);
-						mcpServers.push({ command: "node", args: [scriptPath], env: [], name: MCP_SERVER_NAME });
+					// First call — seed JSONL with recent context via cc-session, then resume
+					const cwd = process.cwd();
+					const contextWithoutLast = context.messages.slice(0, -1); // exclude current user message
+					const toMirror = contextWithoutLast.slice(-MAX_MIRROR_MESSAGES);
+
+					// Only create cc-session and use resume if there's context to seed
+					if (toMirror.length > 0) {
+						const ccSession = createSession({ projectPath: cwd });
+						mirrorPiMessages(ccSession, toMirror);
+						ccSession.save();
+						mirrorSessionId = ccSession.sessionId;
 					}
 
 					const session = await connection.newSession({
-						cwd: process.cwd(),
+						cwd,
 						mcpServers,
 						_meta: {
 							disableBuiltInTools: true,
 							claudeCode: { options: {
-							allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
-							extraArgs: { "strict-mcp-config": null },
-						} },
+								allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
+								extraArgs: { "strict-mcp-config": null },
+								...(mirrorSessionId ? { resume: mirrorSessionId } : {}),
+							} },
 						},
 					} as any);
 
 					sessionId = session.sessionId;
 					activeSessionId = sessionId;
+					if (!mirrorSessionId) mirrorSessionId = sessionId;
 					await connection.setSessionMode({ sessionId, modeId: "bypassPermissions" });
 					await connection.unstable_setSessionModel({ sessionId, modelId: model.id });
 					activeModelId = model.id;
-					const recent = context.messages.slice(-MAX_CONTEXT_MESSAGES);
-					promptText = buildPromptText({ ...context, messages: recent });
-					lastContextLength = context.messages.length;
+					mirrorCursor = context.messages.length;
 				} else {
 					// Continuation — ACP already has prior context
 					sessionId = activeSessionId;
@@ -727,22 +742,41 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 						await connection.unstable_setSessionModel({ sessionId, modelId: model.id });
 						activeModelId = model.id;
 					}
-					const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
-					const lastUserText = lastUser ? messageContentToText(lastUser.content) || "" : "";
-					const missed = context.messages.slice(lastContextLength, -1); // exclude latest user message
-					if (missed.length > 0) {
-						// Messages added by another provider — send catch-up + current prompt
-						const catchUp = buildPromptText({ ...context, messages: missed.slice(-MAX_CONTEXT_MESSAGES) });
-						promptText = `[The following exchanges already happened with another model while you were away. Do not respond to them — they are context only.]\n\n${catchUp}\n\n[End of prior context. Respond to the following message:]\n${lastUserText}`;
-					} else {
-						promptText = lastUserText;
+					const missed = context.messages.slice(mirrorCursor, -1); // exclude current user message
+					if (missed.length > 0 && mirrorSessionId) {
+						// Messages added by another provider — mirror into JSONL and resume
+						killConnection();
+						const cwd = process.cwd();
+						const ccSession = openSession({ sessionId: mirrorSessionId, projectPath: cwd });
+						mirrorPiMessages(ccSession, missed.slice(-MAX_MIRROR_MESSAGES));
+						ccSession.save();
+
+						const conn = await ensureConnection();
+						const resumed = await conn.newSession({
+							cwd,
+							mcpServers,
+							_meta: {
+								disableBuiltInTools: true,
+								claudeCode: { options: {
+									allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
+									extraArgs: { "strict-mcp-config": null },
+									resume: mirrorSessionId,
+								} },
+							},
+						} as any);
+
+						sessionId = resumed.sessionId;
+						activeSessionId = sessionId;
+						await conn.setSessionMode({ sessionId, modeId: "bypassPermissions" });
+						await conn.unstable_setSessionModel({ sessionId, modelId: model.id });
+						activeModelId = model.id;
 					}
-					lastContextLength = context.messages.length;
+					mirrorCursor = context.messages.length;
 				}
 
-				activePromise = connection.prompt({
+				activePromise = acpConnection!.prompt({
 					sessionId: sessionId!,
-					prompt: [{ type: "text", text: promptText }],
+					prompt: [{ type: "text", text: lastUserText }],
 				});
 			}
 
@@ -911,6 +945,15 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		killConnection();
+		resetMirror();
+	});
+	pi.on("session_switch", async () => {
+		killConnection();
+		resetMirror();
+	});
+	pi.on("session_fork", async () => {
+		killConnection();
+		resetMirror();
 	});
 
 	pi.registerProvider(PROVIDER_ID, {

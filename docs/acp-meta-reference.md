@@ -84,6 +84,8 @@ _meta: {
 
 Also accessible at the top level: `newSession` extracts `_meta.claudeCode.options.resume`.
 
+**Tested:** Works with `claude --resume` via CLI. Sessions created or appended to by `cc-session-io` (see `../../cc-session/`) are compatible — Claude Code loads synthetic records and treats them as native conversation history. This enables injecting external messages (e.g., from another provider) into a Claude Code session JSONL, then resuming so Claude Code sees them without catch-up prompts.
+
 ### `maxTurns`
 
 Number. Maximum conversation turns before Claude Code stops.
