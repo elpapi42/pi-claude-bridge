@@ -502,6 +502,13 @@ async function ensureConnection(): Promise<ClientSideConnection> {
 	return connection;
 }
 
+// --- Event-loop ref management ---
+// The ACP child process starts ref'd (default), but ensureConnection() unrefs
+// it after init so it won't block exit when idle. Before any await that reads
+// from the child (prompt, newSession, etc.), call refConnection(). When the
+// work is done, call unrefConnection(). This keeps `-p` mode working: Node
+// can exit when idle, but won't exit while we're waiting for a response.
+
 /** Keep the event loop alive while we're waiting for ACP responses. */
 function refConnection() {
 	if (!acpProcess) return;
@@ -773,6 +780,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 						ccSession.save();
 
 						const conn = await ensureConnection();
+						refConnection(); // re-ref the new child after reconnect
 						const resumed = await conn.newSession({
 							cwd,
 							mcpServers,
