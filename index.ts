@@ -920,11 +920,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 					}
 
 					const result = (raceResult as { kind: "done"; result: PromptResponse }).result;
-					// Populate final token usage from PromptResponse if available.
-					// Skip if there were tool-use cycles — ACP reports cumulative
-					// usage but llm-perf only measures last-turn duration, so
-					// tok/s would be wildly inflated.
-					if (result.usage && !hadToolUseCycles) {
+					if (result.usage) {
 						output.usage.input = result.usage.inputTokens;
 						output.usage.output = result.usage.outputTokens;
 						output.usage.cacheRead = result.usage.cachedReadTokens ?? 0;
