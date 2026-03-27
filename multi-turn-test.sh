@@ -53,14 +53,20 @@ run_json() {
 }
 
 # --- Tests ---
+# Event types: pi --mode json wraps provider events in its own envelope.
+# Top-level types: session, agent_start, agent_end, turn_start, turn_end,
+#   message_start, message_end, message_update, tool_execution_start, tool_execution_end.
+# Provider stream events (text_end, toolcall_end, etc.) are nested under
+#   message_update.assistantMessageEvent.
+# See: vendor/pi-mono/packages/coding-agent/src/core/extensions/types.ts (AgentSessionEvent)
 
 run_json "multi-turn: tool use, context, history" \
-  '([.[] | select(.type == "toolcall_end")] | length) >= 2 and
-   ([.[] | select(.type == "done")] | length) >= 3 and
-   ([.[] | select(.type == "text_end") | .content] | join(" ") | test("'"$EXPECTED_VERSION"'")) and
-   ([.[] | select(.type == "text_end") | .content] | join(" ") | test("banana"))' \
+  '([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 2 and
+   ([.[] | select(.type == "agent_end")] | length) >= 3 and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("'"$EXPECTED_VERSION"'")) and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("banana"))' \
   pi --no-session -ne -e "$DIR" \
-  --model "claude-code-acp/claude-sonnet-4-6" \
+  --model "claude-code-acp/claude-haiku-4-5" \
   --mode json \
   -p "The secret word is 'banana'. Read package.json and tell me the version. Be brief." \
      "Now read README.md and tell me the first heading. Be brief." \

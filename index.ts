@@ -755,6 +755,10 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 			const tools = getToolsForMcp(context.tools, askClaudeToolName);
 
 			// --- Mode B: Resume with tool result ---
+			// Pi expects tool execution between separate streamSimple() calls, but
+			// Claude Code's prompt() stays alive waiting for tool results via MCP.
+			// Mode B bridges the gap: resolve the pending HTTP bridge request with
+			// pi's tool result, letting the still-alive prompt() continue.
 			if (activePromise && pendingToolCall) {
 				sessionId = activeSessionId;
 				const toolResult = extractLastToolResult(context);
