@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke tests for pi-claude-code-acp provider.
-# Requires: pi CLI, Claude Code (for ACP subprocess).
+# Requires: pi CLI, Claude Code (for Agent SDK subprocess).
 # Each test runs pi in print mode with a timeout — if the provider hangs or
 # produces no output, the test fails.
 
@@ -16,7 +16,7 @@ PASS=0
 FAIL=0
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Kill child processes spawned by pi (ACP, node, etc.) that outlive the test.
+# Kill child processes spawned by pi (Agent SDK, node, etc.) that outlive the test.
 # Uses pkill -P to target only descendants of given PIDs.
 kill_descendants() {
   # Kill any remaining children of this shell
@@ -58,7 +58,7 @@ run "provider: --provider flag works" \
 run "provider: model list includes provider" \
   bash -c "pi --no-session -ne -e '$DIR' --list-models 2>&1 | grep claude-code-acp"
 
-# AskClaude only registers when a non-acp provider is active
+# AskClaude only registers when a non-claude-code-acp provider is active
 run "tool: AskClaude registered" \
   bash -c "pi --no-session -ne -e '$DIR' --mode json --model 'openrouter/qwen/qwen3.5-9b' -p 'list your tools' 2>&1 | grep -q AskClaude && echo ok"
 

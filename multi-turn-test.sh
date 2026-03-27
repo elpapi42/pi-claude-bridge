@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Multi-turn integration tests for pi-claude-code-acp provider.
 # Verifies tool use and multi-turn context via --mode json output.
-# Requires: pi CLI, Claude Code (for ACP subprocess), jq.
+# Requires: pi CLI, Claude Code (for Agent SDK subprocess), jq.
 
 set -euo pipefail
 echo "=== multi-turn-test.sh ==="

@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// Session resume/backfill test for pi-claude-code-acp provider.
-// Verifies that switching away from ACP and back correctly mirrors
-// missed messages into the CC session JSONL and resumes.
+// Context continuity test for pi-claude-code-acp provider.
+// Verifies that switching away from the provider and back correctly
+// preserves conversation context (all messages are flattened into
+// each query, so "missed" messages are automatically included).
 //
-// Flow: ACP prompt → switch to non-ACP model → non-ACP prompt →
-//       switch back to ACP → ACP prompt (triggers backfill/resume)
+// Also tests AskClaude shared mode (sees conversation history) vs
+// isolated mode (clean slate).
 //
-// Requires: pi CLI, Claude Code (for ACP subprocess).
+// Requires: pi CLI, Claude Code (for Agent SDK subprocess).
 
 console.log("=== session-resume-test.mjs ===");
 
@@ -138,29 +139,29 @@ function finish(code, msg) {
 await new Promise((r) => setTimeout(r, 2000));
 
 try {
-  // Turn 1: ACP prompt — establishes the ACP session
+  // Turn 1: Provider prompt — establishes context
   console.log("Turn 1: ACP prompt (establish session)...");
   const text1 = await promptAndWait(`The secret word is '${WORD_A}'. Acknowledge and be very brief.`);
   if (!text1) finish(1, "FAIL: Turn 1 produced no text");
   console.log(`  Response: ${text1.slice(0, 80)}`);
 
-  // Switch to non-ACP model — creates "missed messages" scenario
+  // Switch to other model — context should still be preserved on switch-back
   console.log(`Switching to ${OTHER_PROVIDER}/${OTHER_MODEL}...`);
   await send({ type: "set_model", provider: OTHER_PROVIDER, modelId: OTHER_MODEL });
 
-  // Turn 2: Non-ACP prompt — these messages won't be in the CC session
+  // Turn 2: Other-model prompt — adds context that provider must see on switch-back
   console.log("Turn 2: Non-ACP prompt (creates missed messages)...");
   const text2 = await promptAndWait(`The backup word is '${WORD_B}'. Acknowledge briefly.`);
   if (!text2) finish(1, "FAIL: Turn 2 produced no text");
   console.log(`  Response: ${text2.slice(0, 80)}`);
 
-  // Switch back to ACP — next prompt triggers backfill/resume
+  // Switch back to provider — context includes all prior turns
   const [acpProvider, acpModelId] = ACP_MODEL.split("/");
   console.log(`Switching back to ${ACP_MODEL}...`);
   await send({ type: "set_model", provider: acpProvider, modelId: acpModelId });
 
-  // Turn 3: ACP prompt after resume — should have context from all turns
-  console.log("Turn 3: ACP prompt after resume (tests backfill)...");
+  // Turn 3: Provider prompt — should have context from all turns
+  console.log("Turn 3: Provider prompt (tests context continuity)...");
   const text3 = await promptAndWait(
     "What was the secret word and the backup word? Reply with just the two words separated by a comma."
   );
