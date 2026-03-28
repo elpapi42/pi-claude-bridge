@@ -95,13 +95,12 @@ Config files: `~/.pi/agent/claude-bridge.json` (global) and `.pi/claude-bridge.j
 
 **Claude Code loads its own skills** from `~/.claude/skills/` and `.claude/skills/` in addition to the pi skills we forward. These are additive — Claude Code may have skills pi doesn't know about.
 
-**Provider and AskClaude use different tool strategies.** The provider denies Claude Code's built-in tools and routes everything through pi via MCP — pi sees all tool calls but tool names appear as `mcp__custom-tools__*`. AskClaude uses Claude Code's native tools directly — faster and cleaner, but pi only sees the final result, not individual tool calls.
-
 ## Architecture
 
-Uses the Agent SDK's `query()` API directly:
-- **Provider**: `query()` with `canUseTool: () => ({ behavior: "deny" })` + `createSdkMcpServer()` for tool bridging
-- **AskClaude**: `query()` with `permissionMode: "bypassPermissions"` and `disallowedTools` per mode preset
+Both modes use the Agent SDK's `query()` API but with different tool strategies:
+
+- **Provider** denies Claude Code's built-in tools and bridges pi's tools in via MCP (`createSdkMcpServer()`). This gives pi full visibility and control — every tool call appears in the TUI — but tool names show up as `mcp__custom-tools__*`.
+- **AskClaude** uses Claude Code's native tools directly, with `disallowedTools` restricting access per mode (`full`/`read`/`none`). This is faster and cleaner, but pi only sees the final result, not individual tool calls.
 - **Context**: conversation history flattened to text via `buildSessionContext()`
 
 ## TODOs
