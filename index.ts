@@ -662,8 +662,7 @@ function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
 // Lossy: tool results are flattened to text — images/structured data in results are lost.
-// Risk: if pi never calls back (abort, crash), the promise hangs and the SDK generator
-// is stuck. sdkQuery.interrupt() breaks the generator loop but the promise is never rejected.
+// On abort, onAbort() resolves pending handlers so promises don't hang.
 function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
@@ -1017,7 +1016,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	activeQuery = sdkQuery;
 
 	const requestAbort = () => { void sdkQuery.interrupt().catch(() => { try { sdkQuery.close(); } catch {} }); };
-	const onAbort = () => { wasAborted = true; requestAbort(); };
+	const onAbort = () => {
+		wasAborted = true;
+		// Resolve any pending MCP handler so the promise doesn't hang
+		if (pendingToolCall) { pendingToolCall.resolve("Operation aborted"); pendingToolCall = null; }
+		requestAbort();
+	};
 	if (options?.signal) {
 		if (options.signal.aborted) onAbort();
 		else options.signal.addEventListener("abort", onAbort, { once: true });
