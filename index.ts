@@ -28,7 +28,7 @@ const DISALLOWED_BUILTIN_TOOLS = [
 	"CronCreate", "CronDelete", "CronList", "TeamCreate", "TeamDelete",
 	"WebFetch", "WebSearch", "TodoRead", "TodoWrite",
 	"EnterPlanMode", "ExitPlanMode", "RemoteTrigger", "SendMessage",
-	"Skill", "TaskOutput", "TaskStop",
+	"Skill", "TaskOutput", "TaskStop", "ToolSearch",
 ];
 
 const LATEST_MODEL_IDS = new Set(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]);
