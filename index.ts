@@ -1,6 +1,6 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import { buildSessionContext, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createSdkMcpServer, query, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { pascalCase } from "change-case";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
@@ -192,6 +192,7 @@ interface SessionState {
 
 let sharedSession: SessionState | null = null;
 
+const MAX_MIRROR_MESSAGES = 40;
 const SESSION_LOG = join(homedir(), ".pi", "agent", "claude-bridge-session.log");
 function sessionLog(msg: string) {
 	try {
@@ -206,9 +207,12 @@ function convertAndImportMessages(
 	messages: Context["messages"],
 	customToolNameToSdk?: Map<string, string>,
 ): void {
+	const capped = messages.length > MAX_MIRROR_MESSAGES
+		? messages.slice(-MAX_MIRROR_MESSAGES)
+		: messages;
 	const anthropicMessages: Array<{ role: string; content: unknown }> = [];
 
-	for (const msg of messages) {
+	for (const msg of capped) {
 		if (msg.role === "user") {
 			const text = typeof msg.content === "string" ? msg.content : messageContentToText(msg.content);
 			anthropicMessages.push({ role: "user", content: text || "[image]" });
@@ -219,9 +223,13 @@ function convertAndImportMessages(
 				if (block.type === "text") {
 					blocks.push({ type: "text", text: block.text ?? "" });
 				} else if (block.type === "thinking") {
-					// Drop thinking blocks — signatures are bound to the original session
-					// and invalid when replayed in a new session (Case 4 creates a fresh session)
-
+					const sig = (block as any).thinkingSignature;
+					const isAnthropicProvider = (msg as any).provider === PROVIDER_ID
+						|| (msg as any).api === "anthropic";
+					if (isAnthropicProvider && sig) {
+						blocks.push({ type: "thinking", thinking: block.thinking ?? "", signature: sig });
+					}
+					// Non-Anthropic thinking blocks (DeepSeek etc.) have no valid signature — drop
 				} else if (block.type === "toolCall") {
 					const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
 					blocks.push({ type: "tool_use", id: block.id, name: toolName, input: block.arguments ?? {} });
@@ -497,20 +505,20 @@ interface PendingToolCall {
 	resolve: (result: string) => void;
 }
 
-/** Active query that's waiting for a tool result via the MCP bridge. */
+// Module-level state for the push-based streaming pattern
 let activeQuery: ReturnType<typeof query> | null = null;
 let pendingToolCall: PendingToolCall | null = null;
-let onPendingToolCall: (() => void) | null = null;
+let toolCallDetected: (() => void) | null = null;
+let currentPiStream: ReturnType<typeof createAssistantMessageEventStream> | null = null;
 
-/**
- * When Mode B provides a tool result, the active query continues generating.
- * This function is set by Mode A's async block to receive the new pi stream
- * that Mode B events should be pushed to.
- */
-let modeBStream: ReturnType<typeof createAssistantMessageEventStream> | null = null;
-let onModeBStream: (() => void) | null = null;
+// Per-turn output state (reset on each streamSimple call that starts a new pi turn)
+let turnOutput: AssistantMessage | null = null;
+let turnBlocks: Array<any> = [];
+let turnStarted = false;
+let turnSawStreamEvent = false;
+let turnSawToolCall = false;
 
-function resolveMcpTools(context: Context): {
+function resolveMcpTools(context: Context, excludeToolName?: string): {
 	mcpTools: Tool[];
 	customToolNameToSdk: Map<string, string>;
 	customToolNameToPi: Map<string, string>;
@@ -522,7 +530,7 @@ function resolveMcpTools(context: Context): {
 	if (!context.tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
 
 	for (const tool of context.tools) {
-		// All pi tools become MCP tools (built-in SDK tools are disallowed)
+		if (tool.name === excludeToolName) continue;
 		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
 		mcpTools.push(tool);
 		customToolNameToSdk.set(tool.name, sdkName);
@@ -541,15 +549,15 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 		description: tool.description,
 		inputSchema: tool.parameters as unknown,
 		handler: async () => {
-			// Block until pi provides the tool result via Mode B
-			return new Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }>((resolve) => {
+			// Block until pi provides the tool result via the next streamSimple call
+			return new Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }>((resolve) => {
 				pendingToolCall = {
 					toolName: tool.name,
-					resolve: (result: string) => resolve({ content: [{ type: "text", text: result }] }),
+					resolve: (result: string) => resolve({ content: [{ type: "text" as const, text: result }] }),
 				};
-				// Signal that the MCP handler is ready for Mode B
-				onPendingToolCall?.();
-				onPendingToolCall = null;
+				// Signal that the MCP handler has set pendingToolCall
+				toolCallDetected?.();
+				toolCallDetected = null;
 			});
 		},
 	}));
@@ -557,37 +565,12 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 	return { [MCP_SERVER_NAME]: server };
 }
 
-// --- Thinking budget mapping ---
+// --- Effort level mapping ---
+// Pi reasoning levels → CC SDK effort levels
 
-type ThinkingLevel = NonNullable<SimpleStreamOptions["reasoning"]>;
-type NonXhighThinkingLevel = Exclude<ThinkingLevel, "xhigh">;
-
-const DEFAULT_THINKING_BUDGETS: Record<NonXhighThinkingLevel, number> = {
-	minimal: 2048, low: 8192, medium: 16384, high: 31999,
+const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
+	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max",
 };
-
-// "xhigh" is unavailable in the TUI because pi-ai's supportsXhigh() doesn't
-// recognize the "claude-bridge" api type. Opus-4-6 gets shifted budgets so
-// "high" uses the budget that xhigh would normally use.
-const OPUS_46_THINKING_BUDGETS: Record<ThinkingLevel, number> = {
-	minimal: 2048, low: 8192, medium: 31999, high: 63999, xhigh: 63999,
-};
-
-function mapThinkingTokens(
-	reasoning?: ThinkingLevel, modelId?: string, thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"],
-): number | undefined {
-	if (!reasoning) return undefined;
-
-	const isOpus46 = modelId?.includes("opus-4-6") || modelId?.includes("opus-4.6");
-	if (isOpus46) return OPUS_46_THINKING_BUDGETS[reasoning];
-
-	const effectiveReasoning: NonXhighThinkingLevel = reasoning === "xhigh" ? "high" : reasoning;
-	const customBudgets = thinkingBudgets as (Partial<Record<NonXhighThinkingLevel, number>> | undefined);
-	const customBudget = customBudgets?.[effectiveReasoning];
-	if (typeof customBudget === "number" && Number.isFinite(customBudget) && customBudget > 0) return customBudget;
-
-	return DEFAULT_THINKING_BUDGETS[effectiveReasoning];
-}
 
 // --- Provider helpers: misc ---
 
@@ -607,282 +590,318 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 
 // --- Provider: streaming function ---
 //
-// Tool execution uses an MCP bridge pattern:
-// 1. Claude Code calls MCP tool → handler blocks on a Promise (pendingToolCall)
-// 2. We see the tool_use in stream events → push toolcall_end + done(toolUse) to pi
-// 3. Pi executes the tool externally, then calls streamSimple again (Mode B)
-// 4. Mode B resolves the pending Promise with the tool result
-// 5. Claude Code continues generating → we push new events to Mode B's stream
-// 6. The for-await loop runs continuously; only the pi-facing stream switches between calls
-//
-// The key constraint is that pi requires the stream to END before executing tools.
-// So on tool_use we push done+end to the current stream but keep consuming the
-// SDK generator. The MCP handler blocks naturally, pausing the generator until
-// Mode B resolves it. Then new events flow and get pushed to Mode B's stream.
+// Push-based streaming with MCP tool bridge:
+// 1. streamSimple starts a query() and kicks off consumeQuery() in background
+// 2. consumeQuery() iterates the SDK generator, pushing events to currentPiStream
+// 3. On tool_use: ends the current pi stream, nulls it out. The MCP handler
+//    blocks the generator naturally — no events arrive until resolved.
+// 4. Pi executes the tool, calls streamSimple again. We swap in the new stream,
+//    resolve the MCP handler, and the generator unblocks — events flow to new stream.
+
+function resetTurnState(model: Model<any>): void {
+	turnOutput = {
+		role: "assistant", content: [],
+		api: model.api, provider: model.provider, model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop", timestamp: Date.now(),
+	};
+	turnBlocks = turnOutput.content as Array<any>;
+	turnStarted = false;
+	turnSawStreamEvent = false;
+	turnSawToolCall = false;
+}
+
+function ensureTurnStarted(): void {
+	if (!turnStarted && currentPiStream && turnOutput) {
+		currentPiStream.push({ type: "start", partial: turnOutput });
+		turnStarted = true;
+	}
+}
+
+function finalizeCurrentStream(stopReason?: string): void {
+	if (!currentPiStream || !turnOutput) return;
+	if (!turnStarted) ensureTurnStarted();
+	const reason = stopReason === "length" ? "length" : "stop";
+	currentPiStream.push({ type: "done", reason, message: turnOutput });
+	currentPiStream.end();
+	currentPiStream = null;
+}
+
+function processStreamEvent(
+	message: SDKMessage,
+	customToolNameToPi: Map<string, string>,
+	allowSkillAliasRewrite: boolean,
+	model: Model<any>,
+): void {
+	if (!currentPiStream || !turnOutput) return;
+	turnSawStreamEvent = true;
+	const event = (message as SDKMessage & { event: any }).event;
+
+	if (event?.type === "message_start") {
+		const usage = event.message?.usage;
+		turnOutput.usage.input = usage?.input_tokens ?? 0;
+		turnOutput.usage.output = usage?.output_tokens ?? 0;
+		turnOutput.usage.cacheRead = usage?.cache_read_input_tokens ?? 0;
+		turnOutput.usage.cacheWrite = usage?.cache_creation_input_tokens ?? 0;
+		turnOutput.usage.totalTokens = turnOutput.usage.input + turnOutput.usage.output + turnOutput.usage.cacheRead + turnOutput.usage.cacheWrite;
+		calculateCost(model, turnOutput.usage);
+		return;
+	}
+
+	if (event?.type === "content_block_start") {
+		ensureTurnStarted();
+		if (event.content_block?.type === "text") {
+			turnBlocks.push({ type: "text", text: "", index: event.index });
+			currentPiStream.push({ type: "text_start", contentIndex: turnBlocks.length - 1, partial: turnOutput });
+		} else if (event.content_block?.type === "thinking") {
+			turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
+			currentPiStream.push({ type: "thinking_start", contentIndex: turnBlocks.length - 1, partial: turnOutput });
+		} else if (event.content_block?.type === "tool_use") {
+			turnSawToolCall = true;
+			turnBlocks.push({
+				type: "toolCall", id: event.content_block.id,
+				name: mapToolName(event.content_block.name, customToolNameToPi),
+				arguments: (event.content_block.input as Record<string, unknown>) ?? {},
+				partialJson: "", index: event.index,
+			});
+			currentPiStream.push({ type: "toolcall_start", contentIndex: turnBlocks.length - 1, partial: turnOutput });
+		}
+		return;
+	}
+
+	if (event?.type === "content_block_delta") {
+		if (event.delta?.type === "text_delta") {
+			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
+			const block = turnBlocks[index];
+			if (block?.type === "text") {
+				block.text += event.delta.text;
+				currentPiStream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: turnOutput });
+			}
+		} else if (event.delta?.type === "thinking_delta") {
+			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
+			const block = turnBlocks[index];
+			if (block?.type === "thinking") {
+				block.thinking += event.delta.thinking;
+				currentPiStream.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: turnOutput });
+			}
+		} else if (event.delta?.type === "input_json_delta") {
+			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
+			const block = turnBlocks[index];
+			if (block?.type === "toolCall") {
+				block.partialJson += event.delta.partial_json;
+				block.arguments = parsePartialJson(block.partialJson, block.arguments);
+				currentPiStream.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: turnOutput });
+			}
+		} else if (event.delta?.type === "signature_delta") {
+			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
+			const block = turnBlocks[index];
+			if (block?.type === "thinking") {
+				block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
+			}
+		}
+		return;
+	}
+
+	if (event?.type === "content_block_stop") {
+		const index = turnBlocks.findIndex((b: any) => b.index === event.index);
+		const block = turnBlocks[index];
+		if (!block) return;
+		delete block.index;
+		if (block.type === "text") {
+			currentPiStream.push({ type: "text_end", contentIndex: index, content: block.text, partial: turnOutput });
+		} else if (block.type === "thinking") {
+			currentPiStream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: turnOutput });
+		} else if (block.type === "toolCall") {
+			turnSawToolCall = true;
+			block.arguments = mapToolArgs(
+				block.name, parsePartialJson(block.partialJson, block.arguments), allowSkillAliasRewrite,
+			);
+			delete block.partialJson;
+			currentPiStream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: turnOutput });
+		}
+		return;
+	}
+
+	if (event?.type === "message_delta") {
+		turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
+		const usage = event.usage ?? {};
+		if (usage.input_tokens != null) turnOutput.usage.input = usage.input_tokens;
+		if (usage.output_tokens != null) turnOutput.usage.output = usage.output_tokens;
+		if (usage.cache_read_input_tokens != null) turnOutput.usage.cacheRead = usage.cache_read_input_tokens;
+		if (usage.cache_creation_input_tokens != null) turnOutput.usage.cacheWrite = usage.cache_creation_input_tokens;
+		turnOutput.usage.totalTokens = turnOutput.usage.input + turnOutput.usage.output + turnOutput.usage.cacheRead + turnOutput.usage.cacheWrite;
+		calculateCost(model, turnOutput.usage);
+		return;
+	}
+
+	if (event?.type === "message_stop" && turnSawToolCall) {
+		// Tool call complete — end this pi stream. The MCP handler is already
+		// blocking the generator, so no new events arrive until pi calls
+		// streamSimple again and resolves the tool call.
+		turnOutput.stopReason = "toolUse";
+		currentPiStream.push({ type: "done", reason: "toolUse", message: turnOutput });
+		currentPiStream.end();
+		currentPiStream = null;
+
+		if (sharedSession) sharedSession.cursor += turnBlocks.length;
+		return;
+	}
+}
+
+function processAssistantMessage(message: SDKMessage, model: Model<any>): void {
+	if (turnSawStreamEvent) return; // stream events already handled this turn
+	const assistantMsg = (message as any).message;
+	if (!assistantMsg?.content) return;
+	for (const block of assistantMsg.content) {
+		if (block.type === "text" && block.text) {
+			ensureTurnStarted();
+			turnBlocks.push({ type: "text", text: block.text });
+			const idx = turnBlocks.length - 1;
+			currentPiStream?.push({ type: "text_start", contentIndex: idx, partial: turnOutput });
+			currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: block.text, partial: turnOutput });
+			currentPiStream?.push({ type: "text_end", contentIndex: idx, content: block.text, partial: turnOutput });
+		}
+	}
+	// Update usage from complete message
+	if (assistantMsg.usage) {
+		const usage = assistantMsg.usage;
+		if (turnOutput) {
+			if (usage.input_tokens != null) turnOutput.usage.input = usage.input_tokens;
+			if (usage.output_tokens != null) turnOutput.usage.output = usage.output_tokens;
+			if (usage.cache_read_input_tokens != null) turnOutput.usage.cacheRead = usage.cache_read_input_tokens;
+			if (usage.cache_creation_input_tokens != null) turnOutput.usage.cacheWrite = usage.cache_creation_input_tokens;
+			turnOutput.usage.totalTokens = turnOutput.usage.input + turnOutput.usage.output + turnOutput.usage.cacheRead + turnOutput.usage.cacheWrite;
+			calculateCost(model, turnOutput.usage);
+		}
+	}
+}
+
+async function consumeQuery(
+	sdkQuery: ReturnType<typeof query>,
+	customToolNameToPi: Map<string, string>,
+	allowSkillAliasRewrite: boolean,
+	model: Model<any>,
+	wasAborted: () => boolean,
+): Promise<{ capturedSessionId?: string }> {
+	let capturedSessionId: string | undefined;
+
+	for await (const message of sdkQuery) {
+		if (wasAborted()) break;
+		if (!currentPiStream || !turnOutput) continue;
+
+		switch (message.type) {
+			case "stream_event":
+				processStreamEvent(message, customToolNameToPi, allowSkillAliasRewrite, model);
+				break;
+			case "assistant":
+				processAssistantMessage(message, model);
+				break;
+			case "result":
+				if (!turnSawStreamEvent && message.subtype === "success") {
+					if (turnOutput) turnOutput.content.push({ type: "text", text: message.result || "" });
+				}
+				break;
+			case "system":
+				if ((message as any).subtype === "init" && (message as any).session_id) {
+					capturedSessionId = (message as any).session_id;
+				}
+				break;
+		}
+	}
+
+	return { capturedSessionId };
+}
 
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
-	// --- Mode B: tool result turn → resolve the pending MCP handler ---
-	// The query is still alive from Mode A. We provide the new pi stream and resolve
-	// the tool call so Claude Code continues generating into this stream.
-	if (activeQuery) {
-		const resolveToolCall = () => {
+	// --- Tool result turn: swap stream, resolve tool, generator unblocks ---
+	if (activeQuery && pendingToolCall) {
+		currentPiStream = stream;
+		resetTurnState(model);
+		const toolResult = extractLastToolResult(context);
+		sessionLog(`provider: tool result, resolving ${pendingToolCall.toolName}, result=${(toolResult?.content ?? "").slice(0, 60)}`);
+		pendingToolCall.resolve(toolResult?.content ?? "OK");
+		pendingToolCall = null;
+		if (sharedSession) sharedSession.cursor = context.messages.length;
+		return stream;
+	}
+
+	// --- MCP handler not yet called — wait for it ---
+	if (activeQuery && !pendingToolCall) {
+		currentPiStream = stream;
+		resetTurnState(model);
+		toolCallDetected = () => {
 			const toolResult = extractLastToolResult(context);
-			sessionLog(`provider: Mode B, resolving ${pendingToolCall!.toolName}, result=${(toolResult?.content ?? "").slice(0, 60)}`);
-
-			// Give the running Mode A loop the new stream to push events to
-			modeBStream = stream;
-			onModeBStream?.();
-			onModeBStream = null;
-
-			// Resolve the MCP handler — Claude Code continues, new events flow
+			sessionLog(`provider: deferred tool result, resolving ${pendingToolCall!.toolName}, result=${(toolResult?.content ?? "").slice(0, 60)}`);
 			pendingToolCall!.resolve(toolResult?.content ?? "OK");
 			pendingToolCall = null;
 			if (sharedSession) sharedSession.cursor = context.messages.length;
 		};
-
-		if (pendingToolCall) {
-			// MCP handler already called — resolve immediately
-			resolveToolCall();
-		} else {
-			// MCP handler not yet called (race with message_stop).
-			// Wait for it asynchronously — events will flow once resolved.
-			onPendingToolCall = () => resolveToolCall();
-		}
 		return stream;
 	}
 
-	// --- Mode A: fresh prompt → create query and consume events ---
-	(async () => {
-		// Clean up stale query
-		if (activeQuery) { try { activeQuery.close(); } catch {} activeQuery = null; }
+	// --- Fresh query ---
+	currentPiStream = stream;
+	resetTurnState(model);
 
-		const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
-		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const { sessionId: resumeSessionId } = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id);
-		const prompt = extractUserPrompt(context.messages) ?? "";
-		sessionLog(`provider: Mode A, ${context.messages.length} msgs, resume=${resumeSessionId?.slice(0, 8) ?? "none"}, prompt=${prompt.slice(0, 60)}`);
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
+	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+	const { sessionId: resumeSessionId } = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id);
+	const prompt = extractUserPrompt(context.messages) ?? "";
+	sessionLog(`provider: fresh query, ${context.messages.length} msgs, resume=${resumeSessionId?.slice(0, 8) ?? "none"}, prompt=${prompt.slice(0, 60)}`);
 
-		const mcpServers = buildMcpServers(mcpTools);
-		const providerSettings = loadProviderSettings();
-		const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
-		const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
-		const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
-		const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
-		const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-		const allowSkillAliasRewrite = Boolean(skillsAppend);
+	const mcpServers = buildMcpServers(mcpTools);
+	const providerSettings = loadProviderSettings();
+	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
+	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
+	const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
+	const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
+	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+	const allowSkillAliasRewrite = Boolean(skillsAppend);
 
-		const settingSources: SettingSource[] | undefined = appendSystemPrompt
-			? undefined
-			: providerSettings.settingSources ?? ["user", "project"];
-		const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
+	const settingSources: SettingSource[] | undefined = appendSystemPrompt
+		? undefined
+		: providerSettings.settingSources ?? ["user", "project"];
+	const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
 
-		const extraArgs: Record<string, string | null> = { model: model.id };
-		if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
+	const extraArgs: Record<string, string | null> = { model: model.id };
+	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
 
-		const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
-			cwd,
-			disallowedTools: DISALLOWED_BUILTIN_TOOLS,
-			allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
-			permissionMode: "bypassPermissions",
-			includePartialMessages: true,
-			systemPrompt: {
-				type: "preset", preset: "claude_code",
-				append: systemPromptAppend ? systemPromptAppend : undefined,
-			},
-			extraArgs,
-			...(settingSources ? { settingSources } : {}),
-			...(mcpServers ? { mcpServers } : {}),
-			...(resumeSessionId ? { resume: resumeSessionId } : {}),
-		};
+	const effort = options?.reasoning ? REASONING_TO_EFFORT[options.reasoning] : undefined;
 
-		const maxThinkingTokens = mapThinkingTokens(options?.reasoning, model.id, options?.thinkingBudgets);
-		if (maxThinkingTokens != null) queryOptions.maxThinkingTokens = maxThinkingTokens;
+	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
+		cwd,
+		disallowedTools: DISALLOWED_BUILTIN_TOOLS,
+		allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
+		permissionMode: "bypassPermissions",
+		includePartialMessages: true,
+		systemPrompt: {
+			type: "preset", preset: "claude_code",
+			append: systemPromptAppend ? systemPromptAppend : undefined,
+		},
+		extraArgs,
+		...(effort ? { effort } : {}),
+		...(settingSources ? { settingSources } : {}),
+		...(mcpServers ? { mcpServers } : {}),
+		...(resumeSessionId ? { resume: resumeSessionId } : {}),
+	};
 
-		let wasAborted = false;
-		const sdkQuery = query({ prompt, options: queryOptions });
-		activeQuery = sdkQuery;
+	let wasAborted = false;
+	const sdkQuery = query({ prompt, options: queryOptions });
+	activeQuery = sdkQuery;
 
-		const requestAbort = () => { void sdkQuery.interrupt().catch(() => { try { sdkQuery.close(); } catch {} }); };
-		const onAbort = () => { wasAborted = true; requestAbort(); };
-		if (options?.signal) {
-			if (options.signal.aborted) onAbort();
-			else options.signal.addEventListener("abort", onAbort, { once: true });
-		}
+	const requestAbort = () => { void sdkQuery.interrupt().catch(() => { try { sdkQuery.close(); } catch {} }); };
+	const onAbort = () => { wasAborted = true; requestAbort(); };
+	if (options?.signal) {
+		if (options.signal.aborted) onAbort();
+		else options.signal.addEventListener("abort", onAbort, { once: true });
+	}
 
-		// Current pi-facing stream. Starts as the Mode A stream.
-		// Switches to Mode B's stream after each tool-use pause.
-		let piStream = stream;
-
-		// Fresh output state for each pi turn
-		const makeOutput = (): AssistantMessage => ({
-			role: "assistant", content: [],
-			api: model.api, provider: model.provider, model: model.id,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			stopReason: "stop", timestamp: Date.now(),
-		});
-		let output = makeOutput();
-		let blocks = output.content as Array<any>;
-		let started = false;
-		let sawStreamEvent = false;
-		let sawToolCall = false;
-		let capturedSessionId: string | undefined;
-
-		try {
-			for await (const message of sdkQuery) {
-				if (wasAborted) break;
-				if (!started) { piStream.push({ type: "start", partial: output }); started = true; }
-
-				switch (message.type) {
-					case "stream_event": {
-						sawStreamEvent = true;
-						const event = (message as SDKMessage & { event: any }).event;
-
-						if (event?.type === "message_start") {
-							const usage = event.message?.usage;
-							output.usage.input = usage?.input_tokens ?? 0;
-							output.usage.output = usage?.output_tokens ?? 0;
-							output.usage.cacheRead = usage?.cache_read_input_tokens ?? 0;
-							output.usage.cacheWrite = usage?.cache_creation_input_tokens ?? 0;
-							output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-							calculateCost(model, output.usage);
-							break;
-						}
-
-						if (event?.type === "content_block_start") {
-							if (event.content_block?.type === "text") {
-								blocks.push({ type: "text", text: "", index: event.index });
-								piStream.push({ type: "text_start", contentIndex: blocks.length - 1, partial: output });
-							} else if (event.content_block?.type === "thinking") {
-								blocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
-								piStream.push({ type: "thinking_start", contentIndex: blocks.length - 1, partial: output });
-							} else if (event.content_block?.type === "tool_use") {
-								sawToolCall = true;
-								blocks.push({
-									type: "toolCall", id: event.content_block.id,
-									name: mapToolName(event.content_block.name, customToolNameToPi),
-									arguments: (event.content_block.input as Record<string, unknown>) ?? {},
-									partialJson: "", index: event.index,
-								});
-								piStream.push({ type: "toolcall_start", contentIndex: blocks.length - 1, partial: output });
-							}
-							break;
-						}
-
-						if (event?.type === "content_block_delta") {
-							if (event.delta?.type === "text_delta") {
-								const index = blocks.findIndex((b: any) => b.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "text") {
-									block.text += event.delta.text;
-									piStream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: output });
-								}
-							} else if (event.delta?.type === "thinking_delta") {
-								const index = blocks.findIndex((b: any) => b.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "thinking") {
-									block.thinking += event.delta.thinking;
-									piStream.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: output });
-								}
-							} else if (event.delta?.type === "input_json_delta") {
-								const index = blocks.findIndex((b: any) => b.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "toolCall") {
-									block.partialJson += event.delta.partial_json;
-									block.arguments = parsePartialJson(block.partialJson, block.arguments);
-									piStream.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: output });
-								}
-							} else if (event.delta?.type === "signature_delta") {
-								const index = blocks.findIndex((b: any) => b.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "thinking") {
-									block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
-								}
-							}
-							break;
-						}
-
-						if (event?.type === "content_block_stop") {
-							const index = blocks.findIndex((b: any) => b.index === event.index);
-							const block = blocks[index];
-							if (!block) break;
-							delete block.index;
-							if (block.type === "text") {
-								piStream.push({ type: "text_end", contentIndex: index, content: block.text, partial: output });
-							} else if (block.type === "thinking") {
-								piStream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
-							} else if (block.type === "toolCall") {
-								sawToolCall = true;
-								block.arguments = mapToolArgs(
-									block.name, parsePartialJson(block.partialJson, block.arguments), allowSkillAliasRewrite,
-								);
-								delete block.partialJson;
-								piStream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
-							}
-							break;
-						}
-
-						if (event?.type === "message_delta") {
-							output.stopReason = mapStopReason(event.delta?.stop_reason);
-							const usage = event.usage ?? {};
-							if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
-							if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
-							if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
-							if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
-							output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-							calculateCost(model, output.usage);
-							break;
-						}
-
-						if (event?.type === "message_stop" && sawToolCall) {
-							// Tool call complete. Tell pi to execute it by ending this stream.
-							// The query stays alive — the MCP handler will block until Mode B
-							// provides the tool result, at which point new events flow and we
-							// push them to Mode B's stream.
-							output.stopReason = "toolUse";
-							piStream.push({ type: "done", reason: "toolUse", message: output });
-							piStream.end();
-
-							if (sharedSession) sharedSession.cursor += blocks.length; // approximate
-
-							// Wait for Mode B to provide the next stream + resolve the tool
-							piStream = await new Promise<ReturnType<typeof createAssistantMessageEventStream>>((resolve) => {
-								onModeBStream = () => resolve(modeBStream!);
-								// If modeBStream was already set (unlikely race), resolve now
-								if (modeBStream) { resolve(modeBStream); onModeBStream = null; }
-							});
-							modeBStream = null;
-
-							// Reset for the next pi turn
-							output = makeOutput();
-							blocks = output.content as Array<any>;
-							started = false;
-							sawStreamEvent = false;
-							sawToolCall = false;
-							break;
-						}
-
-						break;
-					}
-
-					case "result": {
-						if (!sawStreamEvent && message.subtype === "success") {
-							output.content.push({ type: "text", text: message.result || "" });
-						}
-						break;
-					}
-
-					case "system": {
-						if ((message as any).subtype === "init" && (message as any).session_id) {
-							capturedSessionId = (message as any).session_id;
-						}
-						break;
-					}
-				}
-			}
-
+	// Background consumer — runs until query ends
+	consumeQuery(sdkQuery, customToolNameToPi, allowSkillAliasRewrite, model, () => wasAborted)
+		.then(({ capturedSessionId }) => {
 			// Update session state
 			if (!wasAborted) {
 				const sessionId = capturedSessionId ?? sharedSession?.sessionId;
@@ -892,27 +911,31 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 
 			if (wasAborted || options?.signal?.aborted) {
-				output.stopReason = "aborted";
-				output.errorMessage = "Operation aborted";
-				piStream.push({ type: "error", reason: "aborted", error: output });
-				piStream.end();
+				if (turnOutput) {
+					turnOutput.stopReason = "aborted";
+					turnOutput.errorMessage = "Operation aborted";
+				}
+				currentPiStream?.push({ type: "error", reason: "aborted", error: turnOutput! });
+				currentPiStream?.end();
+				currentPiStream = null;
 			} else {
-				piStream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
-				piStream.end();
+				finalizeCurrentStream(turnOutput?.stopReason);
 			}
-			activeQuery = null;
-		} catch (error) {
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : String(error);
-			piStream.push({ type: "error", reason: output.stopReason as "aborted" | "error", error: output });
-			piStream.end();
-			activeQuery = null;
-		} finally {
+		})
+		.catch((error) => {
+			if (turnOutput) {
+				turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
+				turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
+			}
+			currentPiStream?.push({ type: "error", reason: (turnOutput?.stopReason ?? "error") as "aborted" | "error", error: turnOutput! });
+			currentPiStream?.end();
+			currentPiStream = null;
+		})
+		.finally(() => {
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 			if (activeQuery === sdkQuery) activeQuery = null;
 			sdkQuery.close();
-		}
-	})();
+		});
 
 	return stream;
 }
@@ -964,13 +987,9 @@ async function promptAndWait(
 	const skillsBlock = options?.appendSkills !== false && options?.systemPrompt
 		? extractSkillsBlock(options.systemPrompt) : undefined;
 
-	// Thinking
-	const thinkingMap: Record<string, ThinkingLevel> = {
-		minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh",
-	};
-	const thinkingLevel = options?.thinking && options.thinking !== "off"
-		? thinkingMap[options.thinking] : undefined;
-	const maxThinkingTokens = thinkingLevel ? mapThinkingTokens(thinkingLevel, modelId) : undefined;
+	// Effort
+	const effort = options?.thinking && options.thinking !== "off"
+		? REASONING_TO_EFFORT[options.thinking] : undefined;
 
 	const extraArgs: Record<string, string | null> = {
 		"strict-mcp-config": null,
@@ -983,7 +1002,7 @@ async function promptAndWait(
 			cwd,
 			permissionMode: "bypassPermissions",
 			...(disallowedTools.length ? { disallowedTools } : {}),
-			...(maxThinkingTokens != null ? { maxThinkingTokens } : {}),
+			...(effort ? { effort } : {}),
 			systemPrompt: skillsBlock
 				? { type: "preset", preset: "claude_code", append: skillsBlock }
 				: undefined,
@@ -1070,6 +1089,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Reset shared session on pi session lifecycle events
 	pi.on("session_switch", () => { sharedSession = null; });
+	pi.on("session_fork", () => { sharedSession = null; });
 	pi.on("session_shutdown", () => { sharedSession = null; });
 
 	// --- Provider ---
