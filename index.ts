@@ -112,8 +112,7 @@ function errorMessage(err: unknown): string {
 
 // --- Text extraction ---
 
-// Text-only extraction — images and unknown block types are lost.
-// Callers: extractUserPrompt, extractLastToolResult, convertAndImportMessages (tool results).
+// Text-only extraction — callers: extractUserPrompt, convertAndImportMessages (tool results).
 function messageContentToText(
 	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 ): string {
@@ -286,16 +285,29 @@ function convertAndImportMessages(
 	if (anthropicMessages.length) session.importMessages(anthropicMessages as any);
 }
 
-// Extract text from the last tool result. Goes through messageContentToText,
-// so images in tool results (e.g. screenshots) are lost.
-function extractLastToolResult(context: Context): { content: string; isError: boolean } | null {
+type McpContent = Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
+
+function toolResultToMcpContent(
+	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+): McpContent {
+	if (typeof content === "string") return [{ type: "text", text: content || "" }];
+	if (!Array.isArray(content)) return [{ type: "text", text: "" }];
+	const blocks: McpContent = [];
+	for (const block of content) {
+		if (block.type === "text" && block.text) blocks.push({ type: "text", text: block.text });
+		else if (block.type === "image" && block.data && block.mimeType) blocks.push({ type: "image", data: block.data, mimeType: block.mimeType });
+	}
+	return blocks.length ? blocks : [{ type: "text", text: "" }];
+}
+
+function extractLastToolResult(context: Context): { content: McpContent; isError: boolean } | null {
 	for (let i = context.messages.length - 1; i >= 0; i--) {
 		const msg = context.messages[i];
 		if (msg.role === "toolResult") {
-			const text = typeof msg.content === "string" ? msg.content : messageContentToText(msg.content);
-			return { content: text || "", isError: msg.isError };
+			const blocks = toolResultToMcpContent(msg.content);
+			return { content: blocks, isError: msg.isError };
 		}
-		if (msg.role === "user") break; // stop searching at user messages
+		if (msg.role === "user") break;
 	}
 	return null;
 }
@@ -576,7 +588,7 @@ function readSettingsFile(filePath: string): ProviderSettings {
 
 interface PendingToolCall {
 	toolName: string;
-	resolve: (result: string) => void;
+	resolve: (content: McpContent) => void;
 }
 
 // Module-level state for the push-based streaming pattern.
@@ -661,8 +673,6 @@ function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
 
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
-// Lossy: tool results are flattened to text — images/structured data in results are lost.
-// On abort, onAbort() resolves pending handlers so promises don't hang.
 function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
@@ -671,10 +681,10 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 		inputSchema: jsonSchemaToZodShape(tool.parameters),
 		handler: async () => {
 			// Block until pi provides the tool result via the next streamSimple call
-			return new Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }>((resolve) => {
+			return new Promise<{ content: McpContent; isError?: boolean }>((resolve) => {
 				pendingToolCall = {
 					toolName: tool.name,
-					resolve: (result: string) => resolve({ content: [{ type: "text" as const, text: result }] }),
+					resolve: (content: McpContent) => resolve({ content }),
 				};
 				// Signal that the MCP handler has set pendingToolCall
 				toolCallDetected?.();
@@ -940,8 +950,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		currentPiStream = stream;
 		resetTurnState(model);
 		const toolResult = extractLastToolResult(context);
-		sessionLog(`provider: tool result, resolving ${pendingToolCall.toolName}, result=${(toolResult?.content ?? "").slice(0, 60)}`);
-		pendingToolCall.resolve(toolResult?.content ?? "OK");
+		const mcpContent = toolResult?.content ?? [{ type: "text" as const, text: "OK" }];
+		sessionLog(`provider: tool result, resolving ${pendingToolCall.toolName}, blocks=${mcpContent.length}`);
+		pendingToolCall.resolve(mcpContent);
 		pendingToolCall = null;
 		if (sharedSession) sharedSession.cursor = context.messages.length;
 		return stream;
@@ -953,8 +964,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		resetTurnState(model);
 		toolCallDetected = () => {
 			const toolResult = extractLastToolResult(context);
-			sessionLog(`provider: deferred tool result, resolving ${pendingToolCall!.toolName}, result=${(toolResult?.content ?? "").slice(0, 60)}`);
-			pendingToolCall!.resolve(toolResult?.content ?? "OK");
+			const mcpContent = toolResult?.content ?? [{ type: "text" as const, text: "OK" }];
+			sessionLog(`provider: deferred tool result, resolving ${pendingToolCall!.toolName}, blocks=${mcpContent.length}`);
+			pendingToolCall!.resolve(mcpContent);
 			pendingToolCall = null;
 			if (sharedSession) sharedSession.cursor = context.messages.length;
 		};
@@ -1019,7 +1031,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const onAbort = () => {
 		wasAborted = true;
 		// Resolve any pending MCP handler so the promise doesn't hang
-		if (pendingToolCall) { pendingToolCall.resolve("Operation aborted"); pendingToolCall = null; }
+		if (pendingToolCall) { pendingToolCall.resolve([{ type: "text", text: "Operation aborted" }]); pendingToolCall = null; }
 		requestAbort();
 	};
 	if (options?.signal) {
