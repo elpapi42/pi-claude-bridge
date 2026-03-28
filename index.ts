@@ -394,14 +394,15 @@ function syncSharedSession(
 }
 
 // Extract skills block from pi's system prompt for forwarding to Claude Code
-function extractSkillsBlock(systemPrompt: string): string | undefined {
+function extractSkillsBlock(systemPrompt?: string): string | undefined {
+	if (!systemPrompt) return undefined;
 	const startMarker = "The following skills provide specialized instructions for specific tasks.";
 	const endMarker = "</available_skills>";
 	const start = systemPrompt.indexOf(startMarker);
 	if (start === -1) return undefined;
 	const end = systemPrompt.indexOf(endMarker, start);
 	if (end === -1) return undefined;
-	return systemPrompt.slice(start, end + endMarker.length).trim();
+	return rewriteSkillsLocations(systemPrompt.slice(start, end + endMarker.length).trim());
 }
 
 // --- Provider helpers: tool name mapping ---
@@ -466,17 +467,6 @@ function mapToolArgs(
 
 // --- Provider helpers: system prompt ---
 
-function extractSkillsAppend(systemPrompt?: string): string | undefined {
-	if (!systemPrompt) return undefined;
-	const startMarker = "The following skills provide specialized instructions for specific tasks.";
-	const endMarker = "</available_skills>";
-	const startIndex = systemPrompt.indexOf(startMarker);
-	if (startIndex === -1) return undefined;
-	const endIndex = systemPrompt.indexOf(endMarker, startIndex);
-	if (endIndex === -1) return undefined;
-	const skillsBlock = systemPrompt.slice(startIndex, endIndex + endMarker.length).trim();
-	return rewriteSkillsLocations(skillsBlock);
-}
 
 function rewriteSkillsLocations(skillsBlock: string): string {
 	return skillsBlock.replace(/<location>([^<]+)<\/location>/g, (_match, location: string) => {
@@ -686,6 +676,17 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 	return { [MCP_SERVER_NAME]: server };
 }
 
+// --- Usage helpers ---
+
+function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>): void {
+	if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
+	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
+	if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
+	if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
+	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+	calculateCost(model, output.usage);
+}
+
 // --- Effort level mapping ---
 // Pi reasoning levels → CC SDK effort levels
 
@@ -762,13 +763,7 @@ function processStreamEvent(
 	const event = (message as SDKMessage & { event: any }).event;
 
 	if (event?.type === "message_start") {
-		const usage = event.message?.usage;
-		turnOutput.usage.input = usage?.input_tokens ?? 0;
-		turnOutput.usage.output = usage?.output_tokens ?? 0;
-		turnOutput.usage.cacheRead = usage?.cache_read_input_tokens ?? 0;
-		turnOutput.usage.cacheWrite = usage?.cache_creation_input_tokens ?? 0;
-		turnOutput.usage.totalTokens = turnOutput.usage.input + turnOutput.usage.output + turnOutput.usage.cacheRead + turnOutput.usage.cacheWrite;
-		calculateCost(model, turnOutput.usage);
+		if (event.message?.usage) updateUsage(turnOutput, event.message.usage, model);
 		return;
 	}
 
@@ -796,34 +791,21 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "content_block_delta") {
-		if (event.delta?.type === "text_delta") {
-			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
-			const block = turnBlocks[index];
-			if (block?.type === "text") {
-				block.text += event.delta.text;
-				currentPiStream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: turnOutput });
-			}
-		} else if (event.delta?.type === "thinking_delta") {
-			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
-			const block = turnBlocks[index];
-			if (block?.type === "thinking") {
-				block.thinking += event.delta.thinking;
-				currentPiStream.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: turnOutput });
-			}
-		} else if (event.delta?.type === "input_json_delta") {
-			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
-			const block = turnBlocks[index];
-			if (block?.type === "toolCall") {
-				block.partialJson += event.delta.partial_json;
-				block.arguments = parsePartialJson(block.partialJson, block.arguments);
-				currentPiStream.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: turnOutput });
-			}
-		} else if (event.delta?.type === "signature_delta") {
-			const index = turnBlocks.findIndex((b: any) => b.index === event.index);
-			const block = turnBlocks[index];
-			if (block?.type === "thinking") {
-				block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
-			}
+		const index = turnBlocks.findIndex((b: any) => b.index === event.index);
+		const block = turnBlocks[index];
+		if (!block) return;
+		if (event.delta?.type === "text_delta" && block.type === "text") {
+			block.text += event.delta.text;
+			currentPiStream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: turnOutput });
+		} else if (event.delta?.type === "thinking_delta" && block.type === "thinking") {
+			block.thinking += event.delta.thinking;
+			currentPiStream.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: turnOutput });
+		} else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
+			block.partialJson += event.delta.partial_json;
+			block.arguments = parsePartialJson(block.partialJson, block.arguments);
+			currentPiStream.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: turnOutput });
+		} else if (event.delta?.type === "signature_delta" && block.type === "thinking") {
+			block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
 		} else {
 			debug("processStreamEvent: unhandled content_block_delta type", event.delta?.type);
 		}
@@ -852,13 +834,7 @@ function processStreamEvent(
 
 	if (event?.type === "message_delta") {
 		turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
-		const usage = event.usage ?? {};
-		if (usage.input_tokens != null) turnOutput.usage.input = usage.input_tokens;
-		if (usage.output_tokens != null) turnOutput.usage.output = usage.output_tokens;
-		if (usage.cache_read_input_tokens != null) turnOutput.usage.cacheRead = usage.cache_read_input_tokens;
-		if (usage.cache_creation_input_tokens != null) turnOutput.usage.cacheWrite = usage.cache_creation_input_tokens;
-		turnOutput.usage.totalTokens = turnOutput.usage.input + turnOutput.usage.output + turnOutput.usage.cacheRead + turnOutput.usage.cacheWrite;
-		calculateCost(model, turnOutput.usage);
+		if (event.usage) updateUsage(turnOutput, event.usage, model);
 		return;
 	}
 
@@ -898,18 +874,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>): void {
 			debug("processAssistantMessage: dropping block type", block.type);
 		}
 	}
-	// Update usage from complete message
-	if (assistantMsg.usage) {
-		const usage = assistantMsg.usage;
-		if (turnOutput) {
-			if (usage.input_tokens != null) turnOutput.usage.input = usage.input_tokens;
-			if (usage.output_tokens != null) turnOutput.usage.output = usage.output_tokens;
-			if (usage.cache_read_input_tokens != null) turnOutput.usage.cacheRead = usage.cache_read_input_tokens;
-			if (usage.cache_creation_input_tokens != null) turnOutput.usage.cacheWrite = usage.cache_creation_input_tokens;
-			turnOutput.usage.totalTokens = turnOutput.usage.input + turnOutput.usage.output + turnOutput.usage.cacheRead + turnOutput.usage.cacheWrite;
-			calculateCost(model, turnOutput.usage);
-		}
-	}
+	if (assistantMsg.usage && turnOutput) updateUsage(turnOutput, assistantMsg.usage, model);
 }
 
 /** Background consumer: iterates the SDK generator, pushing events to currentPiStream.
@@ -1003,7 +968,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const providerSettings = loadProviderSettings();
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
-	const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
+	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
 	const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 	const allowSkillAliasRewrite = Boolean(skillsAppend);
