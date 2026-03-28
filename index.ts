@@ -542,12 +542,23 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	return { mcpTools, customToolNameToSdk, customToolNameToPi };
 }
 
+// Wrap a JSON Schema (TypeBox) as a Zod-compatible object so the SDK's
+// validateToolInput doesn't fail on safeParseAsync. We skip validation since
+// pi already validates tool arguments before passing them through.
+function zodPassthrough(jsonSchema: unknown): unknown {
+	return {
+		...jsonSchema as Record<string, unknown>,
+		safeParseAsync: async (data: unknown) => ({ success: true, data }),
+		safeParse: (data: unknown) => ({ success: true, data }),
+	};
+}
+
 function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
-		inputSchema: tool.parameters as unknown,
+		inputSchema: zodPassthrough(tool.parameters) as unknown,
 		handler: async () => {
 			// Block until pi provides the tool result via the next streamSimple call
 			return new Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }>((resolve) => {
