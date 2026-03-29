@@ -38,4 +38,6 @@
   An explicit state enum would be tidier in theory, but the interleaving of SDK
   generator, pi streams, and MCP tool calls is inherently complex — a state enum
   would likely coexist with the stream reference anyway, just moving complexity
-  around. The existing flags are well-commented and consistent.
+  around. The per-turn flags are well-commented and consistent. The tool result
+  synchronization was refactored to symmetric queues (2026-03-29), eliminating
+  the `toolCallDetected` callback and DEFERRED path that caused deadlocks.
