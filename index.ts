@@ -1097,7 +1097,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const sdkQuery = query({ prompt, options: queryOptions });
 	activeQuery = sdkQuery;
 
-	const requestAbort = () => { void sdkQuery.interrupt().catch(() => { try { sdkQuery.close(); } catch {} }); };
+	const requestAbort = () => {
+		// interrupt() asks the CLI to stop gracefully; close() kills it immediately.
+		// Both are needed — interrupt alone lets the current API call finish.
+		void sdkQuery.interrupt().catch(() => {});
+		try { sdkQuery.close(); } catch {}
+	};
 	const onAbort = () => {
 		wasAborted = true;
 		// Resolve any pending MCP handler so the promise doesn't hang
