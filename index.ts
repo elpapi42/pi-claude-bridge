@@ -1048,6 +1048,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				pendingResults.push(result);
 				debug(`provider: queued result (${pendingResults.length} pending)`);
 			}
+			// Invariant: at most one queue has entries at any time
+			if (pendingToolCalls.length > 0 && pendingResults.length > 0) {
+				debug(`BUG: both queues non-empty! handlers=${pendingToolCalls.length} results=${pendingResults.length}`);
+			}
 		}
 		if (sharedSession) sharedSession.cursor = context.messages.length;
 		return stream;
