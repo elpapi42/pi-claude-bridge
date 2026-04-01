@@ -1,4 +1,4 @@
 node_modules/
 .claude/
 .test-output/
-eli/
+eli/.DS_Store
