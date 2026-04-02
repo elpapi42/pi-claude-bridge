@@ -1098,6 +1098,10 @@ async function consumeQuery(
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
+	// DEBUG: trace followUp message triggering
+	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
+	debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${activeQuery !== null}`);
+
 	// --- Tool result delivery ---
 	// Pi appends tool results to context and calls back. Extract this turn's results
 	// (everything after the last assistant message) and match against waiting MCP
