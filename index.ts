@@ -1532,8 +1532,11 @@ export default function (pi: ExtensionAPI) {
 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 		}
 	};
-	pi.on("session_switch", () => clearSession("session_switch"));
-	pi.on("session_fork", () => clearSession("session_fork"));
+	pi.on("session_start", (event) => {
+		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
+			clearSession(`session_start:${event.reason}`);
+		}
+	});
 	pi.on("session_shutdown", () => clearSession("session_shutdown"));
 
 	// --- Provider ---
