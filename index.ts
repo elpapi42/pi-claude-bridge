@@ -839,6 +839,7 @@ function updateUsage(output: AssistantMessage, usage: Record<string, number | un
 	if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
 	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 	calculateCost(model, output.usage);
+	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens} model=${model.id}`);
 }
 
 // --- Effort level mapping ---
@@ -1424,7 +1425,7 @@ async function promptAndWait(
 	debug("askClaude:",
 		`mode=${mode} model=${modelId} effort=${effort ?? "default"}`,
 		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
-		`skills=${Boolean(skillsBlock)} prompt=${prompt.slice(0, 60)}`);
+		`skills=${Boolean(skillsBlock)} promptLen=${prompt.length}`);
 
 	const sdkQuery = query({
 		prompt,
@@ -1453,10 +1454,14 @@ async function promptAndWait(
 	signal?.addEventListener("abort", onAbort, { once: true });
 
 	let responseText = "";
+	let sdkMessageCount = 0;
+	let textDeltaCount = 0;
+	let resultSubtype: string | undefined;
 
 	try {
 		for await (const message of sdkQuery) {
 			if (wasAborted) break;
+			sdkMessageCount++;
 
 			switch (message.type) {
 				case "stream_event": {
@@ -1464,10 +1469,12 @@ async function promptAndWait(
 					// Text deltas → accumulate and stream
 					if (event?.type === "content_block_delta" && event.delta?.type === "text_delta") {
 						responseText += event.delta.text;
+						textDeltaCount++;
 						options?.onStreamUpdate?.(responseText);
 					}
 					// Tool call start → track for action summary progress
 					if (event?.type === "content_block_start" && event.content_block?.type === "tool_use") {
+						debug(`askClaude: tool_use start: ${event.content_block.name}`);
 						toolCalls.set(event.content_block.id, {
 							name: event.content_block.name,
 							status: "running",
@@ -1489,6 +1496,7 @@ async function promptAndWait(
 					break;
 				}
 				case "result": {
+					resultSubtype = message.subtype;
 					if (!responseText && message.subtype === "success" && message.result) {
 						responseText = message.result;
 					}
@@ -1497,7 +1505,12 @@ async function promptAndWait(
 			}
 		}
 
-		return { responseText, stopReason: wasAborted ? "cancelled" : "stop" };
+		const stopReason = wasAborted ? "cancelled" : "stop";
+		debug(`askClaude: done`,
+			`stopReason=${stopReason} resultSubtype=${resultSubtype ?? "none"}`,
+			`sdkMessages=${sdkMessageCount} textDeltas=${textDeltaCount} responseLen=${responseText.length}`,
+			`toolCalls=${toolCalls.size}`);
+		return { responseText, stopReason };
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
 		sdkQuery.close();
@@ -1640,6 +1653,7 @@ export default function (pi: ExtensionAPI) {
 			async execute(_id, params, signal, onUpdate, ctx) {
 				// Guard: circular delegation
 				if (ctx.model?.baseUrl === "claude-bridge") {
+					debug("askClaude: blocked circular delegation (active provider is claude-bridge)");
 					return {
 						content: [{ type: "text" as const, text: "Error: AskClaude cannot be used when the active provider is claude-bridge — you're already running through Claude Code." }],
 						details: { error: true },
@@ -1683,7 +1697,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				} catch (err) {
 					clearInterval(progressInterval);
-					debug(`askClaude error: mode=${mode}, model=${params.model ?? "default"}, isolated=${params.isolated ?? false}, error=`, err);
+					debug(`askClaude error: mode=${mode}, model=${params.model ?? "default"}, isolated=${params.isolated ?? false}, elapsed=${((Date.now() - start) / 1000).toFixed(1)}s, error=`, err);
 					const msg = errorMessage(err);
 					return {
 						content: [{ type: "text" as const, text: `Error: ${msg}` }],
