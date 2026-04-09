@@ -353,7 +353,9 @@ function convertAndImportMessages(
 					debug("convertAndImportMessages: dropping assistant block type", (block as any).type);
 				}
 			}
-			if (blocks.length) anthropicMessages.push({ role: "assistant", content: blocks });
+			// Never drop an assistant message entirely — that would break turn-taking
+			if (!blocks.length) blocks.push({ type: "text", text: "[non-Anthropic content omitted]" });
+			anthropicMessages.push({ role: "assistant", content: blocks });
 		} else if (msg.role === "toolResult") {
 			const text = typeof msg.content === "string" ? msg.content : messageContentToText(msg.content);
 			anthropicMessages.push({
