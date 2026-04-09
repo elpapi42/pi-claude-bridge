@@ -27,7 +27,7 @@
     "claude-bridge2.png"
   ],
   "scripts": {
-    "test:unit": "node tests/test-queue.mjs && node tests/test-import.mjs",
+    "test:unit": "node tests/test-queue.mjs && node tests/test-import.mjs && node tests/test-skills.mjs",
     "test": "set -a && [ -f .env.test ] && . .env.test; set +a && npm run test:unit && tests/smoke-test.sh && tests/multi-turn-test.sh && tests/cache-test.sh && tests/session-resume-test.mjs"
   },
   "type": "module",

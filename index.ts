@@ -10,7 +10,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { createSession } from "cc-session-io";
 import { appendFileSync, existsSync, readFileSync } from "fs";
 import { homedir } from "os";
-import { dirname, join, relative, resolve } from "path";
+import { dirname, join, resolve } from "path";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -102,10 +102,6 @@ function resolveModelId(input: string): string {
 
 // --- Skills/settings paths ---
 
-const SKILLS_ALIAS_GLOBAL = "~/.claude/skills";
-const SKILLS_ALIAS_PROJECT = ".claude/skills";
-const GLOBAL_SKILLS_ROOT = join(homedir(), ".pi", "agent", "skills");
-const PROJECT_SKILLS_ROOT = join(process.cwd(), ".pi", "skills");
 const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
 const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
@@ -536,7 +532,7 @@ function extractSkillsBlock(systemPrompt?: string): string | undefined {
 	if (start === -1) return undefined;
 	const end = systemPrompt.indexOf(endMarker, start);
 	if (end === -1) return undefined;
-	return rewriteSkillsLocations(systemPrompt.slice(start, end + endMarker.length).trim());
+	return rewriteSkillsBlock(systemPrompt.slice(start, end + endMarker.length).trim());
 }
 
 // --- Provider helpers: tool name mapping ---
@@ -564,24 +560,6 @@ function mapToolName(name: string, customToolNameToPi?: Map<string, string>): st
 	return name;
 }
 
-function rewriteSkillAliasPath(pathValue: unknown): unknown {
-	if (typeof pathValue !== "string") return pathValue;
-	if (pathValue.startsWith(SKILLS_ALIAS_GLOBAL)) {
-		return pathValue.replace(SKILLS_ALIAS_GLOBAL, "~/.pi/agent/skills");
-	}
-	if (pathValue.startsWith(`./${SKILLS_ALIAS_PROJECT}`)) {
-		return pathValue.replace(`./${SKILLS_ALIAS_PROJECT}`, PROJECT_SKILLS_ROOT);
-	}
-	if (pathValue.startsWith(SKILLS_ALIAS_PROJECT)) {
-		return pathValue.replace(SKILLS_ALIAS_PROJECT, PROJECT_SKILLS_ROOT);
-	}
-	const projectAliasAbs = join(process.cwd(), SKILLS_ALIAS_PROJECT);
-	if (pathValue.startsWith(projectAliasAbs)) {
-		return pathValue.replace(projectAliasAbs, PROJECT_SKILLS_ROOT);
-	}
-	return pathValue;
-}
-
 // Renames for Claude Code SDK param names that differ from pi's native names.
 // Keys not listed here pass through unchanged, so new pi params work automatically.
 const SDK_KEY_RENAMES: Record<string, Record<string, string>> = {
@@ -594,7 +572,7 @@ const SDK_KEY_RENAMES: Record<string, Record<string, string>> = {
 // Maps SDK tool args to pi tool args via key renaming + pass-through.
 // Pi's own prepareArguments hooks handle any structural transforms (e.g. edit oldText/newText → edits[]).
 function mapToolArgs(
-	toolName: string, args: Record<string, unknown> | undefined, allowSkillAliasRewrite = true,
+	toolName: string, args: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
 	const input = args ?? {};
 	const renames = SDK_KEY_RENAMES[toolName.toLowerCase()];
@@ -602,9 +580,6 @@ function mapToolArgs(
 	for (const [key, value] of Object.entries(input)) {
 		const piKey = renames?.[key] ?? key;
 		if (!(piKey in result)) result[piKey] = value; // first alias wins
-	}
-	if (allowSkillAliasRewrite && typeof result.path === "string") {
-		result.path = rewriteSkillAliasPath(result.path);
 	}
 	// Pi bash has no default timeout; add a safety default
 	if (toolName.toLowerCase() === "bash" && result.timeout == null) {
@@ -616,18 +591,11 @@ function mapToolArgs(
 // --- Provider helpers: system prompt ---
 
 
-function rewriteSkillsLocations(skillsBlock: string): string {
-	return skillsBlock.replace(/<location>([^<]+)<\/location>/g, (_match, location: string) => {
-		let rewritten = location;
-		if (location.startsWith(GLOBAL_SKILLS_ROOT)) {
-			const relPath = relative(GLOBAL_SKILLS_ROOT, location).replace(/^\.+/, "");
-			rewritten = `${SKILLS_ALIAS_GLOBAL}/${relPath}`.replace(/\/\/+/g, "/");
-		} else if (location.startsWith(PROJECT_SKILLS_ROOT)) {
-			const relPath = relative(PROJECT_SKILLS_ROOT, location).replace(/^\.+/, "");
-			rewritten = `${SKILLS_ALIAS_PROJECT}/${relPath}`.replace(/\/\/+/g, "/");
-		}
-		return `<location>${rewritten}</location>`;
-	});
+function rewriteSkillsBlock(skillsBlock: string): string {
+	return skillsBlock.replace(
+		"Use the read tool to load a skill's file",
+		`Use the read tool (mcp__${MCP_SERVER_NAME}__read) to load a skill's file`,
+	);
 }
 
 function resolveAgentsMdPath(): string | undefined {
@@ -945,7 +913,6 @@ function finalizeCurrentStream(stopReason?: string): void {
 function processStreamEvent(
 	message: SDKMessage,
 	customToolNameToPi: Map<string, string>,
-	allowSkillAliasRewrite: boolean,
 	model: Model<any>,
 ): void {
 	if (!currentPiStream || !turnOutput) return;
@@ -1014,7 +981,7 @@ function processStreamEvent(
 		} else if (block.type === "toolCall") {
 			turnSawToolCall = true;
 			block.arguments = mapToolArgs(
-				block.name, parsePartialJson(block.partialJson, block.arguments), allowSkillAliasRewrite,
+				block.name, parsePartialJson(block.partialJson, block.arguments),
 			);
 			delete block.partialJson;
 			currentPiStream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: turnOutput });
@@ -1054,7 +1021,7 @@ function processStreamEvent(
 // arrives before any stream_events, this is the primary content path. Must maintain
 // the same stream lifecycle as processStreamEvent — including ending the stream on
 // tool_use to prevent deadlock with the MCP handler.
-function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>, allowSkillAliasRewrite: boolean): void {
+function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>): void {
 	if (turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
@@ -1077,7 +1044,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		} else if (block.type === "tool_use") {
 			ensureTurnStarted();
 			turnSawToolCall = true;
-			const mappedArgs = mapToolArgs(mapToolName(block.name, customToolNameToPi), block.input, allowSkillAliasRewrite);
+			const mappedArgs = mapToolArgs(mapToolName(block.name, customToolNameToPi), block.input);
 			turnBlocks.push({
 				type: "toolCall", id: block.id,
 				name: mapToolName(block.name, customToolNameToPi),
@@ -1110,7 +1077,6 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
-	allowSkillAliasRewrite: boolean,
 	model: Model<any>,
 	wasAborted: () => boolean,
 ): Promise<{ capturedSessionId?: string }> {
@@ -1122,10 +1088,10 @@ async function consumeQuery(
 
 		switch (message.type) {
 			case "stream_event":
-				processStreamEvent(message, customToolNameToPi, allowSkillAliasRewrite, model);
+				processStreamEvent(message, customToolNameToPi, model);
 				break;
 			case "assistant":
-				processAssistantMessage(message, model, customToolNameToPi, allowSkillAliasRewrite);
+				processAssistantMessage(message, model, customToolNameToPi);
 				break;
 			case "result":
 				if (!turnSawStreamEvent && message.subtype === "success") {
@@ -1283,7 +1249,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
 	const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-	const allowSkillAliasRewrite = Boolean(skillsAppend);
 
 	// MCP auto-loading suppression: CC auto-loads MCP servers from ~/.claude.json and
 	// .mcp.json when filesystem settings are loaded. Since pi executes tools (not CC),
@@ -1348,7 +1313,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, allowSkillAliasRewrite, model, () => wasAborted)
+	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted)
 		.then(({ capturedSessionId }) => {
 			debug(`provider: consumeQuery completed, stopReason=${turnOutput?.stopReason}, error=${turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
