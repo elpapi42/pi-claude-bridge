@@ -32,6 +32,13 @@
   applicable to AskClaude subagents. See `fractary/pi-claude-code`
   `PlanMode.ts`.
 
+## Testing Gaps
+
+- **maxHistoryMessages capping + tool pairing**: `convertAndImportMessages` caps
+  history to `maxHistoryMessages` by slicing from the end. If the slice boundary
+  falls mid-tool-sequence, an orphaned `tool_use` or `tool_result` block could
+  produce an invalid API request. Needs a test and possibly boundary-aware slicing.
+
 ## Deferred
 
 - **Session JSONL cleanup**: Track session IDs created during a pi session. On

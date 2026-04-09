@@ -23,16 +23,13 @@ mkdir -p "$LOGDIR"
 kill_descendants() { pkill -P $$ 2>/dev/null || true; sleep 1; }
 trap kill_descendants EXIT
 
-DEBUG_LOG="$HOME/.pi/agent/claude-bridge.log"
+DEBUG_LOG="$LOGDIR/cache-test-debug.log"
 
 TMPFILE="$LOGDIR/cache-test-scratch.txt"
-rm -f "$TMPFILE"
-
-# Clear debug log so we only see entries from this run
-> "$DEBUG_LOG" 2>/dev/null || true
+rm -f "$TMPFILE" "$DEBUG_LOG"
 
 echo "Running 5-turn conversation (text + tool use)..."
-CLAUDE_BRIDGE_DEBUG=1 timeout 180 pi --no-session -ne -e "$DIR" \
+CLAUDE_BRIDGE_DEBUG=1 CLAUDE_BRIDGE_DEBUG_PATH="$DEBUG_LOG" timeout 180 pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
   -p "The secret number is 42. Acknowledge briefly." \
@@ -40,14 +37,33 @@ CLAUDE_BRIDGE_DEBUG=1 timeout 180 pi --no-session -ne -e "$DIR" \
      "What is 42 * 2? Just the number." \
      "Read $TMPFILE and tell me what's in it." \
      "What was the secret number, what did you write, what did you read, and what was 42*2? One per line." \
-  > "$LOGFILE" 2>"$LOGFILE.err"
+  > "$LOGFILE" 2>"$LOGFILE.err" || PI_EXIT=$?
+PI_EXIT=${PI_EXIT:-0}
 
 rm -f "$TMPFILE"
+
+if [ -s "$LOGFILE.err" ]; then
+  echo ""
+  echo "pi stderr:"
+  cat "$LOGFILE.err"
+  echo ""
+fi
+
+if [ "$PI_EXIT" -ne 0 ]; then
+  echo "FAIL: pi exited with code $PI_EXIT"
+  exit 1
+fi
 
 echo ""
 echo "Turn-by-turn cache metrics:"
 echo "---"
 printf "%-6s  %8s  %8s  %8s  %8s  %s\n" "Turn" "Input" "CacheRd" "CacheWr" "Output" "CacheHit%"
+
+# Thresholds
+MIN_CACHE_HIT_PCT=90
+MIN_EXPECTED_TURNS=7    # 5 prompts + 2 tool sub-turns (write + read)
+MIN_CASE3_RESUMES=2
+EXPECTED_CASE1=1
 
 TURN=0
 FAIL=0
@@ -77,9 +93,9 @@ while IFS= read -r line; do
       echo "  FAIL: Turn $TURN cacheRead ($CACHE_READ) decreased from turn $((TURN - 1)) ($PREV_CACHE_READ)"
       FAIL=$((FAIL + 1))
     fi
-    # Cache hit rate should be high (>90% of input from cache)
-    if [ "$HIT_PCT" -lt 90 ]; then
-      echo "  FAIL: Turn $TURN cache hit rate ${HIT_PCT}% < 50%"
+    # Cache hit rate should be high
+    if [ "$HIT_PCT" -lt $MIN_CACHE_HIT_PCT ]; then
+      echo "  FAIL: Turn $TURN cache hit rate ${HIT_PCT}% < ${MIN_CACHE_HIT_PCT}%"
       FAIL=$((FAIL + 1))
     fi
   fi
@@ -89,9 +105,9 @@ done < <(jq -c 'select(.type == "turn_end") | .message.usage | {input, cacheRead
 
 echo "---"
 
-# Tool calls create sub-turns, so we expect more than 5 turn_end events
-if [ "$TURN" -lt 7 ]; then
-  echo "WARNING: Only $TURN turns detected (expected >= 7 with tool use sub-turns)."
+if [ "$TURN" -lt $MIN_EXPECTED_TURNS ]; then
+  echo "FAIL: Only $TURN turns detected (expected >= $MIN_EXPECTED_TURNS with tool use sub-turns)"
+  FAIL=$((FAIL + 1))
 fi
 
 # --- Assert session resume (no spurious rebuilds) ---
@@ -102,12 +118,20 @@ fi
 echo ""
 echo "Session sync cases:"
 
-CASE2_COUNT=$(grep -c "Case 2:" "$DEBUG_LOG" 2>/dev/null || echo 0)
-CASE3_COUNT=$(grep -c "Case 3:" "$DEBUG_LOG" 2>/dev/null || echo 0)
-CASE4_COUNT=$(grep -c "Case 4:" "$DEBUG_LOG" 2>/dev/null || echo 0)
-echo "  Case 2 (first turn): $CASE2_COUNT"
-echo "  Case 3 (resume):     $CASE3_COUNT"
-echo "  Case 4 (rebuild):    $CASE4_COUNT"
+CASE1_COUNT=$(grep -c "Case 1:" "$DEBUG_LOG" 2>/dev/null || true)
+CASE1_COUNT=${CASE1_COUNT:-0}
+CASE3_COUNT=$(grep -c "Case 3:" "$DEBUG_LOG" 2>/dev/null || true)
+CASE3_COUNT=${CASE3_COUNT:-0}
+CASE4_COUNT=$(grep -c "Case 4:" "$DEBUG_LOG" 2>/dev/null || true)
+CASE4_COUNT=${CASE4_COUNT:-0}
+echo "  Case 1 (clean start): $CASE1_COUNT"
+echo "  Case 3 (resume):      $CASE3_COUNT"
+echo "  Case 4 (rebuild):     $CASE4_COUNT"
+
+if [ "$CASE1_COUNT" -ne $EXPECTED_CASE1 ]; then
+  echo "  FAIL: Expected exactly $EXPECTED_CASE1 Case 1 (clean start), got $CASE1_COUNT"
+  FAIL=$((FAIL + 1))
+fi
 
 if [ "$CASE4_COUNT" -gt 0 ]; then
   echo "  FAIL: $CASE4_COUNT spurious Case 4 rebuilds (expected 0 for consecutive same-provider turns)"
@@ -115,8 +139,8 @@ if [ "$CASE4_COUNT" -gt 0 ]; then
   FAIL=$((FAIL + 1))
 fi
 
-if [ "$CASE3_COUNT" -lt 2 ]; then
-  echo "  FAIL: Expected at least 2 Case 3 resumes for turns 2+, got $CASE3_COUNT"
+if [ "$CASE3_COUNT" -lt $MIN_CASE3_RESUMES ]; then
+  echo "  FAIL: Expected at least $MIN_CASE3_RESUMES Case 3 resumes for turns 2+, got $CASE3_COUNT"
   FAIL=$((FAIL + 1))
 fi
 
