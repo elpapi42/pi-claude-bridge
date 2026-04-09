@@ -1,4 +1,5 @@
-import { calculateCost, createAssistantMessageEventStream, getModels, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
+import { calculateCost, getModels, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
+import * as piAi from "@mariozechner/pi-ai";
 import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
@@ -10,6 +11,13 @@ import { createSession } from "cc-session-io";
 import { appendFileSync, existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, relative, resolve } from "path";
+
+// Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
+const _piAi = piAi as any;
+const newAssistantMessageEventStream: () => AssistantMessageEventStream =
+	typeof _piAi.createAssistantMessageEventStream === "function"
+		? _piAi.createAssistantMessageEventStream
+		: () => new _piAi.AssistantMessageEventStream();
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
@@ -718,7 +726,7 @@ interface PendingToolCall {
 // their own pi sessions (subagents, AskClaude, etc.) to share this module instance.
 // The queryStateStack below protects the parent query's state from reentrant corruption.
 let activeQuery: ReturnType<typeof query> | null = null;
-let currentPiStream: ReturnType<typeof createAssistantMessageEventStream> | null = null;
+let currentPiStream: AssistantMessageEventStream | null = null;
 
 // Symmetric queues for matching MCP handlers ↔ tool results.
 // At any time, at most ONE of these has entries (never both):
@@ -1158,7 +1166,7 @@ async function consumeQuery(
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	const stream = createAssistantMessageEventStream();
+	const stream = newAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
