@@ -32,6 +32,14 @@
   applicable to AskClaude subagents. See `fractary/pi-claude-code`
   `PlanMode.ts`.
 
+## Architecture Issues
+
+- **Module-level mutable state**: `activeQuery`, `currentPiStream`, `pendingToolCalls`, etc.
+  are module-level variables coordinating two async flows. The `queryStateStack` save/restore
+  pattern works but is fragile — any new state variable must be manually included in the
+  save/restore or reentrant queries corrupt parent state. Consider encapsulating into a
+  class instance keyed by session/query ID.
+
 ## Testing Gaps
 
 - **maxHistoryMessages capping + tool pairing**: `convertAndImportMessages` caps

@@ -113,6 +113,7 @@ const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 // --- Config ---
 
 interface Config {
+	/** @deprecated Unsafe: can slice mid-tool-sequence causing orphaned tool_result without matching tool_use */
 	maxHistoryMessages?: number;
 	askClaude?: {
 		enabled?: boolean;
@@ -727,6 +728,8 @@ interface PendingToolCall {
 // Node's native import cache (tryNative:true) can cause extensions that spawn
 // their own pi sessions (subagents, AskClaude, etc.) to share this module instance.
 // The queryStateStack below protects the parent query's state from reentrant corruption.
+// FIXME: All module-level state must be manually saved/restored in queryStateStack.
+// Adding a new variable without updating save/restore corrupts reentrant queries.
 let activeQuery: ReturnType<typeof query> | null = null;
 let currentPiStream: AssistantMessageEventStream | null = null;
 
@@ -1183,6 +1186,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		resetTurnState(model);
 		const allResults = extractAllToolResults(context);
 		debug(`provider: tool results, ${allResults.length} results, ${pendingToolCalls.length} waiting handlers, ctx.msgs=${context.messages.length}`);
+		// NOTE: Positional (FIFO) matching assumes pi delivers results in the same
+		// order Claude called the tools. If pi ever executes tools in parallel or
+		// reorders delivery, handlers get wrong results silently.
 		for (const result of allResults) {
 			if (pendingToolCalls.length > 0) {
 				const pending = pendingToolCalls.shift()!;
@@ -1194,6 +1200,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				debug(`provider: queued result (${pendingResults.length} pending)`);
 			}
 			// Invariant: at most one queue has entries at any time
+			// FIXME: Violation causes silent data corruption. Should force-recover by draining.
 			if (pendingToolCalls.length > 0 && pendingResults.length > 0) {
 				debug(`BUG: both queues non-empty! handlers=${pendingToolCalls.length} results=${pendingResults.length}`);
 			}
@@ -1214,6 +1221,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		if (sharedSession) sharedSession.cursor = context.messages.length;
 		queueMicrotask(() => {
+			// FIXME: turnOutput is read from module scope — if another streamSimple call
+			// runs between queueing and firing, the wrong turnOutput is used.
 			resetTurnState(model);
 			stream.push({ type: "done", reason: "stop", message: turnOutput });
 			stream.end();
