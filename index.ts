@@ -405,21 +405,22 @@ function msgPreview(msg: { role: string; content?: unknown }): string {
 
 // Pi doesn't pass tool results directly — it appends them to the context and calls
 // the provider again. This function scrapes them back out by walking the context tail.
-// Fragile: assumes a clean assistant → toolResult* sequence with nothing interleaved.
-// See issue #3 — breaks when pi injects user messages between tool_use and toolResult.
+// Walks past user messages (steer/followUp) that pi may inject between toolResults.
+// Stops at the nearest assistant message (turn boundary).
 function extractAllToolResults(context: Context): McpResult[] {
 	const results: McpResult[] = [];
 	let stopIdx = -1;
 	for (let i = context.messages.length - 1; i >= 0; i--) {
 		const msg = context.messages[i];
 		if (msg.role === "toolResult") {
-			results.unshift({ content: toolResultToMcpContent(msg.content), isError: msg.isError });
-		} else if (msg.role === "user" || msg.role === "assistant") { stopIdx = i; break; }
+			results.unshift({ content: toolResultToMcpContent(msg.content), isError: msg.isError, toolCallId: msg.toolCallId });
+		} else if (msg.role === "assistant") { stopIdx = i; break; }
+		// user messages: skip (steer/followUp injected mid-tool-execution)
 	}
 	debug(`extractAllToolResults: ${results.length} results from ${context.messages.length} msgs, stopped at index ${stopIdx}`);
 	debug(`extractAllToolResults: all msg roles:`, context.messages.map((m, i) => `[${i}]${m.role}`).join(" "));
 	for (let r = 0; r < results.length; r++) {
-		debug(`extractAllToolResults: result[${r}]${results[r].isError ? " ERROR" : ""} preview:`, JSON.stringify(results[r].content).slice(0, 150));
+		debug(`extractAllToolResults: result[${r}] id=${results[r].toolCallId}${results[r].isError ? " ERROR" : ""} preview:`, JSON.stringify(results[r].content).slice(0, 150));
 	}
 	return results;
 }
@@ -692,7 +693,7 @@ function readSettingsFile(filePath: string): ProviderSettings {
 
 // --- Provider helpers: tool bridge ---
 
-interface McpResult { content: McpContent; isError?: boolean; [key: string]: unknown }
+interface McpResult { content: McpContent; isError?: boolean; toolCallId?: string; [key: string]: unknown }
 
 interface PendingToolCall {
 	toolName: string;
@@ -709,22 +710,27 @@ interface PendingToolCall {
 let activeQuery: ReturnType<typeof query> | null = null;
 let currentPiStream: AssistantMessageEventStream | null = null;
 
-// Symmetric queues for matching MCP handlers ↔ tool results.
-// At any time, at most ONE of these has entries (never both):
+// ID-based matching for MCP handlers ↔ tool results.
+// Maps are keyed by toolCallId. At any time, at most ONE map has entries:
 //   pendingToolCalls — MCP handlers blocked on a Promise, waiting for a result
 //   pendingResults   — tool results delivered by pi, waiting for an MCP handler
-// Positional: both queues are FIFO; the SDK fires handlers in tool_use order,
-// and pi delivers results in the same order.
-let pendingToolCalls: PendingToolCall[] = [];
-let pendingResults: McpResult[] = [];
+let pendingToolCalls = new Map<string, PendingToolCall>();
+let pendingResults = new Map<string, McpResult>();
+
+// IDs from the current turn's tool_use blocks, used to assign IDs to MCP handlers.
+// The SDK calls handlers in the same order as tool_use blocks in the assistant message.
+let turnToolCallIds: string[] = [];
+let nextHandlerIdx = 0;
 
 // State stack: when a subagent starts a fresh query while the main query is active,
 // we save the main's state and restore it when the subagent's query ends.
 interface SavedQueryState {
 	activeQuery: typeof activeQuery;
 	currentPiStream: typeof currentPiStream;
-	pendingToolCalls: PendingToolCall[];
-	pendingResults: McpResult[];
+	pendingToolCalls: Map<string, PendingToolCall>;
+	pendingResults: Map<string, McpResult>;
+	turnToolCallIds: string[];
+	nextHandlerIdx: number;
 }
 const queryStateStack: SavedQueryState[] = [];
 
@@ -822,9 +828,8 @@ function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
 
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
-// Matching is purely positional (FIFO) — the SDK fires handlers in tool_use
-// order and pi delivers results in the same order. The tool.name in logs is
-// the registered tool definition, not necessarily the tool the SDK is calling.
+// Handlers are assigned toolCallIds from turnToolCallIds (populated when the SDK
+// emits tool_use blocks). Results are matched by ID, not position.
 function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
@@ -832,14 +837,17 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 		description: tool.description,
 		inputSchema: jsonSchemaToZodShape(tool.parameters),
 		handler: async () => {
-			if (pendingResults.length > 0) {
-				const result = pendingResults.shift()!;
-				debug(`mcp handler: ${tool.name} → resolved from queue (${pendingResults.length} remaining)`);
+			const toolCallId = turnToolCallIds[nextHandlerIdx++];
+			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (idx=${nextHandlerIdx - 1}, available=${turnToolCallIds.length})`);
+			if (toolCallId && pendingResults.has(toolCallId)) {
+				const result = pendingResults.get(toolCallId)!;
+				pendingResults.delete(toolCallId);
+				debug(`mcp handler: ${tool.name} [${toolCallId}] → resolved from queue (${pendingResults.size} remaining)`);
 				return result;
 			}
-			debug(`mcp handler: ${tool.name} → waiting`);
+			debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
 			return new Promise<McpResult>((resolve) => {
-				pendingToolCalls.push({ toolName: tool.name, resolve });
+				pendingToolCalls.set(toolCallId, { toolName: tool.name, resolve });
 			});
 		},
 	}));
@@ -912,6 +920,9 @@ function resetTurnState(model: Model<any>): void {
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
+	// NOTE: turnToolCallIds and nextHandlerIdx are NOT reset here.
+	// They persist across tool-result delivery callbacks because the SDK may
+	// still call MCP handlers after the first result is delivered.
 }
 
 function ensureTurnStarted(): void {
@@ -944,6 +955,8 @@ function processStreamEvent(
 	const event = (message as SDKMessage & { event: any }).event;
 
 	if (event?.type === "message_start") {
+		turnToolCallIds = [];
+		nextHandlerIdx = 0;
 		if (event.message?.usage) updateUsage(turnOutput, event.message.usage, model);
 		return;
 	}
@@ -958,6 +971,7 @@ function processStreamEvent(
 			currentPiStream.push({ type: "thinking_start", contentIndex: turnBlocks.length - 1, partial: turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
 			turnSawToolCall = true;
+			turnToolCallIds.push(event.content_block.id);
 			turnBlocks.push({
 				type: "toolCall", id: event.content_block.id,
 				name: mapToolName(event.content_block.name, customToolNameToPi),
@@ -1049,6 +1063,8 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	if (turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+	turnToolCallIds = [];
+	nextHandlerIdx = 0;
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
 		if (block.type === "text" && block.text) {
@@ -1068,6 +1084,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		} else if (block.type === "tool_use") {
 			ensureTurnStarted();
 			turnSawToolCall = true;
+			turnToolCallIds.push(block.id);
 			const mappedArgs = mapToolArgs(mapToolName(block.name, customToolNameToPi), block.input);
 			turnBlocks.push({
 				type: "toolCall", id: block.id,
@@ -1175,29 +1192,27 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		currentPiStream = stream;
 		resetTurnState(model);
 		const allResults = extractAllToolResults(context);
-		debug(`provider: tool results, ${allResults.length} results, ${pendingToolCalls.length} waiting handlers, ctx.msgs=${context.messages.length}`);
-		// NOTE: Positional (FIFO) matching assumes pi delivers results in the same
-		// order Claude called the tools. If pi ever executes tools in parallel or
-		// reorders delivery, handlers get wrong results silently.
+		debug(`provider: tool results, ${allResults.length} results, ${pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
 		for (const result of allResults) {
-			if (pendingToolCalls.length > 0) {
-				const pending = pendingToolCalls.shift()!;
-				debug(`provider: resolving ${pending.toolName}${result.isError ? " (error)" : ""}`, JSON.stringify(result.content).slice(0, 200));
+			const id = result.toolCallId;
+			if (id && pendingToolCalls.has(id)) {
+				const pending = pendingToolCalls.get(id)!;
+				pendingToolCalls.delete(id);
+				debug(`provider: resolving ${pending.toolName} [${id}]${result.isError ? " (error)" : ""}`, JSON.stringify(result.content).slice(0, 200));
 				pending.resolve(result);
-				debug(`provider: pending.resolve called, SDK should continue...`);
+			} else if (id) {
+				pendingResults.set(id, result);
+				debug(`provider: queued result [${id}] (${pendingResults.size} pending)`);
 			} else {
-				pendingResults.push(result);
-				debug(`provider: queued result (${pendingResults.length} pending)`);
+				debug(`WARNING: tool result without toolCallId, cannot match`);
 			}
-			// Invariant: at most one queue has entries at any time
-			// FIXME: Violation causes silent data corruption. Should force-recover by draining.
-			if (pendingToolCalls.length > 0 && pendingResults.length > 0) {
-				debug(`BUG: both queues non-empty! handlers=${pendingToolCalls.length} results=${pendingResults.length}`);
+			if (pendingToolCalls.size > 0 && pendingResults.size > 0) {
+				debug(`BUG: both maps non-empty! handlers=${pendingToolCalls.size} results=${pendingResults.size}`);
 			}
 		}
-		if (pendingToolCalls.length > 0) {
-			debug(`WARNING: ${pendingToolCalls.length} MCP handlers still waiting after delivering ${allResults.length} results`);
-			piUI?.notify(`Claude bridge: ${pendingToolCalls.length} tool handler(s) still waiting — provider may be stuck`, "warning");
+		if (pendingToolCalls.size > 0) {
+			debug(`WARNING: ${pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);
+			piUI?.notify(`Claude bridge: ${pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
 		}
 		if (sharedSession) sharedSession.cursor = context.messages.length;
 		return stream;
@@ -1230,15 +1245,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		queryStateStack.push({
 			activeQuery,
 			currentPiStream,
-			pendingToolCalls: [...pendingToolCalls],
-			pendingResults: [...pendingResults],
+			pendingToolCalls: new Map(pendingToolCalls),
+			pendingResults: new Map(pendingResults),
+			turnToolCallIds: [...turnToolCallIds],
+			nextHandlerIdx,
 		});
 		debug(`provider: saving state (stack depth ${queryStateStack.length}), reentrant fresh query`);
 	}
 
 	currentPiStream = stream;
-	pendingToolCalls.length = 0;
-	pendingResults.length = 0;
+	pendingToolCalls.clear();
+	pendingResults.clear();
 	resetTurnState(model);
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
@@ -1326,9 +1343,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 	const onAbort = () => {
 		wasAborted = true;
-		for (const pending of pendingToolCalls) { pending.resolve({ content: [{ type: "text", text: "Operation aborted" }] }); }
-		pendingToolCalls.length = 0;
-		pendingResults.length = 0;
+		for (const pending of pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Operation aborted" }] }); }
+		pendingToolCalls.clear();
+		pendingResults.clear();
 		requestAbort();
 	};
 	if (options?.signal) {
@@ -1385,24 +1402,23 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		.finally(() => {
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 			if (activeQuery === sdkQuery) {
-				// Drain this query's queues before restoring parent state
-				for (const pending of pendingToolCalls) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
-				pendingToolCalls.length = 0;
-				pendingResults.length = 0;
+				// Drain this query's maps before restoring parent state
+				for (const pending of pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
+				pendingToolCalls.clear();
+				pendingResults.clear();
 
 				// If this was a reentrant query, restore the parent's state
 				if (isReentrant && queryStateStack.length > 0) {
 					const saved = queryStateStack.pop()!;
 					activeQuery = saved.activeQuery;
 					currentPiStream = saved.currentPiStream;
-					pendingToolCalls.length = 0;
-					pendingToolCalls.push(...saved.pendingToolCalls);
-					pendingResults.length = 0;
-					pendingResults.push(...saved.pendingResults);
+					pendingToolCalls = new Map(saved.pendingToolCalls);
+					pendingResults = new Map(saved.pendingResults);
+					turnToolCallIds = saved.turnToolCallIds;
+					nextHandlerIdx = saved.nextHandlerIdx;
 					debug(`provider: restored state (stack depth ${queryStateStack.length})`);
 				} else {
-					// DEBUG: trace when activeQuery is cleared
-					debug(`provider: clearing activeQuery (non-reentrant), pending handlers=${pendingToolCalls.length}, pendingResults=${pendingResults.length}`);
+					debug(`provider: clearing activeQuery (non-reentrant), pending handlers=${pendingToolCalls.size}, pendingResults=${pendingResults.size}`);
 					activeQuery = null;
 				}
 			}

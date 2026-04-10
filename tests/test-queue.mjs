@@ -5,43 +5,50 @@
 import assert from "node:assert/strict";
 
 // --- Extracted queue logic (mirrors index.ts pendingToolCalls/pendingResults) ---
+// ID-based: both maps are keyed by toolCallId.
 
 function createBridge() {
-	const pendingHandlers = []; // { resolve }
-	const pendingResults = []; // { content, isError? }
+	const pendingHandlers = new Map(); // toolCallId → { resolve }
+	const pendingResults = new Map();  // toolCallId → { content, isError? }
 
 	return {
 		// Called by MCP handler: resolve immediately from queue, or block.
-		waitForResult() {
-			if (pendingResults.length > 0) return Promise.resolve(pendingResults.shift());
-			return new Promise((resolve) => { pendingHandlers.push({ resolve }); });
+		waitForResult(toolCallId) {
+			if (pendingResults.has(toolCallId)) {
+				const result = pendingResults.get(toolCallId);
+				pendingResults.delete(toolCallId);
+				return Promise.resolve(result);
+			}
+			return new Promise((resolve) => { pendingHandlers.set(toolCallId, { resolve }); });
 		},
 
 		// Called by tool result delivery: resolve a waiting handler, or queue.
 		deliverResult(result) {
-			if (pendingHandlers.length > 0) {
-				pendingHandlers.shift().resolve(result);
+			const id = result.toolCallId;
+			if (pendingHandlers.has(id)) {
+				const h = pendingHandlers.get(id);
+				pendingHandlers.delete(id);
+				h.resolve(result);
 			} else {
-				pendingResults.push(result);
+				pendingResults.set(id, result);
 			}
 		},
 
 		// Called on abort/query end.
 		drain(fallback) {
-			for (const h of pendingHandlers) h.resolve(fallback);
-			pendingHandlers.length = 0;
-			pendingResults.length = 0;
+			for (const h of pendingHandlers.values()) h.resolve(fallback);
+			pendingHandlers.clear();
+			pendingResults.clear();
 		},
 
-		get handlersWaiting() { return pendingHandlers.length; },
-		get resultsQueued() { return pendingResults.length; },
+		get handlersWaiting() { return pendingHandlers.size; },
+		get resultsQueued() { return pendingResults.size; },
 
-		// Invariant: at most one queue is non-empty.
+		// Invariant: no single ID appears in both maps simultaneously.
 		assertMutualExclusion() {
-			assert.ok(
-				!(pendingHandlers.length > 0 && pendingResults.length > 0),
-				`Mutual exclusion violated: ${pendingHandlers.length} handlers, ${pendingResults.length} results`,
-			);
+			for (const id of pendingHandlers.keys()) {
+				assert.ok(!pendingResults.has(id), `ID ${id} in both maps`);
+			}
 		},
 	};
 }
@@ -66,14 +73,13 @@ console.log("Scenario A: results before handlers");
 
 await test("N results queued, then N handlers resolve immediately", async () => {
 	const bridge = createBridge();
-	const results = [{ content: [{ type: "text", text: "r0" }] }, { content: [{ type: "text", text: "r1" }] }, { content: [{ type: "text", text: "r2" }] }];
-	for (const r of results) bridge.deliverResult(r);
+	for (let i = 0; i < 3; i++) bridge.deliverResult({ toolCallId: `t${i}`, content: [{ type: "text", text: `r${i}` }] });
 	assert.equal(bridge.resultsQueued, 3);
 	assert.equal(bridge.handlersWaiting, 0);
 	bridge.assertMutualExclusion();
 
 	for (let i = 0; i < 3; i++) {
-		const got = await bridge.waitForResult();
+		const got = await bridge.waitForResult(`t${i}`);
 		assert.equal(got.content[0].text, `r${i}`);
 	}
 	assert.equal(bridge.resultsQueued, 0);
@@ -84,15 +90,15 @@ await test("N results queued, then N handlers resolve immediately", async () => 
 
 console.log("Scenario B: handlers before results");
 
-await test("N handlers block, then N results resolve them in order", async () => {
+await test("N handlers block, then N results resolve them by ID", async () => {
 	const bridge = createBridge();
 	const promises = [];
-	for (let i = 0; i < 3; i++) promises.push(bridge.waitForResult());
+	for (let i = 0; i < 3; i++) promises.push(bridge.waitForResult(`t${i}`));
 	assert.equal(bridge.handlersWaiting, 3);
 	assert.equal(bridge.resultsQueued, 0);
 	bridge.assertMutualExclusion();
 
-	for (let i = 0; i < 3; i++) bridge.deliverResult({ content: [{ type: "text", text: `r${i}` }] });
+	for (let i = 0; i < 3; i++) bridge.deliverResult({ toolCallId: `t${i}`, content: [{ type: "text", text: `r${i}` }] });
 	const resolved = await Promise.all(promises);
 	for (let i = 0; i < 3; i++) assert.equal(resolved[i].content[0].text, `r${i}`);
 	assert.equal(bridge.handlersWaiting, 0);
@@ -105,36 +111,36 @@ console.log("Scenario C: interleaved");
 
 await test("handler blocks → result resolves → result queued → handler immediate", async () => {
 	const bridge = createBridge();
-	const p1 = bridge.waitForResult(); // blocks
+	const p1 = bridge.waitForResult("t0"); // blocks
 	assert.equal(bridge.handlersWaiting, 1);
 
-	bridge.deliverResult({ content: [{ type: "text", text: "r0" }] }); // resolves p1
+	bridge.deliverResult({ toolCallId: "t0", content: [{ type: "text", text: "r0" }] }); // resolves p1
 	assert.equal(bridge.handlersWaiting, 0);
 	const got1 = await p1;
 	assert.equal(got1.content[0].text, "r0");
 
-	bridge.deliverResult({ content: [{ type: "text", text: "r1" }] }); // queued
+	bridge.deliverResult({ toolCallId: "t1", content: [{ type: "text", text: "r1" }] }); // queued
 	assert.equal(bridge.resultsQueued, 1);
 	bridge.assertMutualExclusion();
 
-	const got2 = await bridge.waitForResult(); // immediate from queue
+	const got2 = await bridge.waitForResult("t1"); // immediate from queue
 	assert.equal(got2.content[0].text, "r1");
 	assert.equal(bridge.resultsQueued, 0);
 });
 
-// --- Scenario D: positional ordering with identity ---
+// --- Scenario D: ID-based matching with mixed arrival order ---
 
-console.log("Scenario D: positional ordering");
+console.log("Scenario D: ID-based matching");
 
-await test("results always match handlers by position", async () => {
+await test("results match handlers by ID regardless of arrival order", async () => {
 	const bridge = createBridge();
 	const N = 7;
 	// Mix: first 3 handlers arrive, then 5 results, then 4 more handlers
 	const promises = [];
-	for (let i = 0; i < 3; i++) promises.push(bridge.waitForResult());
-	for (let i = 0; i < 5; i++) bridge.deliverResult({ content: [{ type: "text", text: `r${i}` }] });
-	for (let i = 3; i < N; i++) promises.push(bridge.waitForResult());
-	for (let i = 5; i < N; i++) bridge.deliverResult({ content: [{ type: "text", text: `r${i}` }] });
+	for (let i = 0; i < 3; i++) promises.push(bridge.waitForResult(`t${i}`));
+	for (let i = 0; i < 5; i++) bridge.deliverResult({ toolCallId: `t${i}`, content: [{ type: "text", text: `r${i}` }] });
+	for (let i = 3; i < N; i++) promises.push(bridge.waitForResult(`t${i}`));
+	for (let i = 5; i < N; i++) bridge.deliverResult({ toolCallId: `t${i}`, content: [{ type: "text", text: `r${i}` }] });
 
 	const resolved = await Promise.all(promises);
 	for (let i = 0; i < N; i++) {
@@ -150,8 +156,8 @@ console.log("Scenario E: abort");
 await test("drain resolves all waiting handlers with fallback", async () => {
 	const bridge = createBridge();
 	const promises = [];
-	for (let i = 0; i < 4; i++) promises.push(bridge.waitForResult());
-	bridge.deliverResult({ content: [{ type: "text", text: "r0" }] });
+	for (let i = 0; i < 4; i++) promises.push(bridge.waitForResult(`t${i}`));
+	bridge.deliverResult({ toolCallId: "t0", content: [{ type: "text", text: "r0" }] });
 	// 3 still waiting, 1 resolved
 	const fallback = { content: [{ type: "text", text: "aborted" }] };
 	bridge.drain(fallback);
@@ -164,15 +170,15 @@ await test("drain resolves all waiting handlers with fallback", async () => {
 
 await test("drain clears queued results", async () => {
 	const bridge = createBridge();
-	bridge.deliverResult({ content: [{ type: "text", text: "stale" }] });
-	bridge.deliverResult({ content: [{ type: "text", text: "stale" }] });
+	bridge.deliverResult({ toolCallId: "t0", content: [{ type: "text", text: "stale" }] });
+	bridge.deliverResult({ toolCallId: "t1", content: [{ type: "text", text: "stale" }] });
 	assert.equal(bridge.resultsQueued, 2);
 	bridge.drain({ content: [] });
 	assert.equal(bridge.resultsQueued, 0);
 	// New handler should block, not get stale data
-	const p = bridge.waitForResult();
+	const p = bridge.waitForResult("t2");
 	assert.equal(bridge.handlersWaiting, 1);
-	bridge.deliverResult({ content: [{ type: "text", text: "fresh" }] });
+	bridge.deliverResult({ toolCallId: "t2", content: [{ type: "text", text: "fresh" }] });
 	const got = await p;
 	assert.equal(got.content[0].text, "fresh");
 });
@@ -184,13 +190,13 @@ console.log("Scenario F: isError propagation");
 await test("isError flag flows through both paths", async () => {
 	const bridge = createBridge();
 	// Path 1: result queued, handler picks up
-	bridge.deliverResult({ content: [{ type: "text", text: "err" }], isError: true });
-	const got1 = await bridge.waitForResult();
+	bridge.deliverResult({ toolCallId: "t0", content: [{ type: "text", text: "err" }], isError: true });
+	const got1 = await bridge.waitForResult("t0");
 	assert.equal(got1.isError, true);
 
 	// Path 2: handler blocks, result resolves
-	const p = bridge.waitForResult();
-	bridge.deliverResult({ content: [{ type: "text", text: "ok" }], isError: false });
+	const p = bridge.waitForResult("t1");
+	bridge.deliverResult({ toolCallId: "t1", content: [{ type: "text", text: "ok" }], isError: false });
 	const got2 = await p;
 	assert.equal(got2.isError, false);
 });
@@ -202,9 +208,9 @@ console.log("Scenario G: fresh query after drain");
 await test("new query sees clean state after drain", async () => {
 	const bridge = createBridge();
 	// Query 1: deliver results and handlers, then drain mid-flight
-	bridge.deliverResult({ content: [{ type: "text", text: "q1-stale" }] });
-	const p = bridge.waitForResult();
-	bridge.deliverResult({ content: [{ type: "text", text: "q1-stale2" }] });
+	bridge.deliverResult({ toolCallId: "t0", content: [{ type: "text", text: "q1-stale" }] });
+	const p = bridge.waitForResult("t0");
+	bridge.deliverResult({ toolCallId: "t1", content: [{ type: "text", text: "q1-stale2" }] });
 	await p; // resolves with q1-stale
 	assert.equal(bridge.resultsQueued, 1); // q1-stale2 sitting in queue
 	bridge.drain({ content: [] });
@@ -212,9 +218,9 @@ await test("new query sees clean state after drain", async () => {
 	assert.equal(bridge.handlersWaiting, 0);
 
 	// Query 2: fresh start — handler must not see q1 data
-	const p2 = bridge.waitForResult();
+	const p2 = bridge.waitForResult("t2");
 	assert.equal(bridge.handlersWaiting, 1);
-	bridge.deliverResult({ content: [{ type: "text", text: "q2-fresh" }] });
+	bridge.deliverResult({ toolCallId: "t2", content: [{ type: "text", text: "q2-fresh" }] });
 	const got = await p2;
 	assert.equal(got.content[0].text, "q2-fresh");
 });
@@ -236,10 +242,11 @@ function extractAllToolResults(messages) {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (msg.role === "toolResult") {
-			results.unshift({ content: msg.content, isError: msg.isError });
-		} else if (msg.role === "user" || msg.role === "assistant") {
+			results.unshift({ content: msg.content, isError: msg.isError, toolCallId: msg.toolCallId });
+		} else if (msg.role === "assistant") {
 			break;
 		}
+		// user messages: skip (steer/followUp injected mid-tool-execution)
 	}
 	return results;
 }
@@ -297,11 +304,23 @@ await test("three turns: only last turn's results", async () => {
 
 console.log("Scenario H2: interleaved messages in tool result sequences");
 
+// Helper: extract tool call IDs from the last assistant message (like turnToolCallIds)
+function getToolCallIds(messages) {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			return msg.content.filter((b) => b.type === "toolCall").map((b) => b.id);
+		}
+	}
+	return [];
+}
+
 // Helper: run extractAllToolResults and also simulate bridge delivery
 function simulateDelivery(messages, expectedHandlers) {
 	const results = extractAllToolResults(messages);
+	const ids = getToolCallIds(messages);
 	const bridge = createBridge();
-	for (let i = 0; i < expectedHandlers; i++) bridge.waitForResult();
+	for (let i = 0; i < expectedHandlers; i++) bridge.waitForResult(ids[i] ?? `unknown_${i}`);
 	for (const r of results) bridge.deliverResult(r);
 	return { results, bridge };
 }
@@ -567,9 +586,9 @@ await test("random delivery/handler orderings always drain correctly", async () 
 		const promises = new Array(n);
 		for (const op of ops) {
 			if (op.type === "deliver") {
-				bridge.deliverResult({ content: [{ type: "text", text: `r${op.idx}` }] });
+				bridge.deliverResult({ toolCallId: `t${op.idx}`, content: [{ type: "text", text: `r${op.idx}` }] });
 			} else {
-				promises[op.idx] = bridge.waitForResult();
+				promises[op.idx] = bridge.waitForResult(`t${op.idx}`);
 			}
 			bridge.assertMutualExclusion();
 		}
