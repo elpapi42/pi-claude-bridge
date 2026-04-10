@@ -18,7 +18,7 @@ export default function (pi: ExtensionAPI) {
 				const timer = setTimeout(r, delay);
 				signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
 			});
-			return { content: [{ type: "text" as const, text: `SlowTool completed after ${delay}ms` }] };
+			return { content: [{ type: "text" as const, text: `SlowTool completed after ${delay}ms` }], details: {} };
 		},
 	});
 }

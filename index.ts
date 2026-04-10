@@ -1699,7 +1699,8 @@ export default function (pi: ExtensionAPI) {
 			apiKey: "not-used",
 			api: "claude-bridge",
 			models: MODELS,
-			streamSimple: streamClaudeAgentSdk,
+			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
+			streamSimple: streamClaudeAgentSdk as any,
 		});
 	} else {
 		// Subsequent instance (subagent session): skip registration entirely.
@@ -1776,7 +1777,7 @@ export default function (pi: ExtensionAPI) {
 					const truncated = body.length > PREVIEW_MAX_CHARS ? body.substring(0, PREVIEW_MAX_CHARS) : body;
 					const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
 					if (lines.length) text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
-					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", `… (${keyHint("expandTools", "to expand")})`)}`;
+					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", `… (${keyHint("app.tools.expand", "to expand")})`)}`;
 
 				}
 

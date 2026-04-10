@@ -43,7 +43,7 @@
   },
   "devDependencies": {
     "@mariozechner/pi-ai": "^0.52.0",
-    "@mariozechner/pi-coding-agent": "^0.52.0",
+    "@mariozechner/pi-coding-agent": "^0.66.1",
     "@types/node": "^24.3.0"
   },
   "pi": {
