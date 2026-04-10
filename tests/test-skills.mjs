@@ -3,6 +3,7 @@
  * Verifies we correctly extract skills from pi's system prompt and rewrite
  * the read tool reference for the Claude Code MCP bridge.
  */
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 const MCP_SERVER_NAME = "custom-tools";
@@ -27,8 +28,6 @@ function extractSkillsBlock(systemPrompt) {
 	return rewriteSkillsBlock(systemPrompt.slice(start, end + endMarker.length).trim());
 }
 
-// --- Tests ---
-
 // Realistic pi system prompt with skills block
 const SYSTEM_PROMPT = `You are a coding assistant.
 
@@ -51,35 +50,35 @@ When a skill file references a relative path, resolve it against the skill direc
 
 Some other system prompt content after skills.`;
 
-{
-	const result = extractSkillsBlock(SYSTEM_PROMPT);
-	assert.ok(result, "should extract skills block");
+describe("skills block extraction", () => {
+	it("extracts and rewrites read tool reference", () => {
+		const result = extractSkillsBlock(SYSTEM_PROMPT);
+		assert.ok(result, "should extract skills block");
+		assert.ok(result.includes("Use the read tool (mcp__custom-tools__read) to load a skill's file"));
+		assert.ok(!result.includes("Use the read tool to load a skill's file\n"));
+	});
 
-	// Tool name is rewritten
-	assert.ok(result.includes("Use the read tool (mcp__custom-tools__read) to load a skill's file"), "should rewrite read tool reference");
-	assert.ok(!result.includes("Use the read tool to load a skill's file\n"), "should not contain original read tool reference");
+	it("preserves skill paths as-is", () => {
+		const result = extractSkillsBlock(SYSTEM_PROMPT);
+		assert.ok(result.includes("/Users/esd/projects/pi-my-stuff/skills/br/SKILL.md"));
+		assert.ok(result.includes("/Users/esd/.pi/agent/skills/deep-research/SKILL.md"));
+	});
 
-	// Skill paths are preserved as-is (no aliasing)
-	assert.ok(result.includes("/Users/esd/projects/pi-my-stuff/skills/br/SKILL.md"), "should preserve project skill path");
-	assert.ok(result.includes("/Users/esd/.pi/agent/skills/deep-research/SKILL.md"), "should preserve global skill path");
+	it("correct boundaries", () => {
+		const result = extractSkillsBlock(SYSTEM_PROMPT);
+		assert.ok(result.startsWith("The following skills"));
+		assert.ok(result.endsWith("</available_skills>"));
+		assert.ok(!result.includes("Some other system prompt"));
+	});
 
-	// Boundaries are correct
-	assert.ok(result.startsWith("The following skills"), "should start at skills block");
-	assert.ok(result.endsWith("</available_skills>"), "should end at closing tag");
-	assert.ok(!result.includes("Some other system prompt"), "should not include content after skills block");
-}
+	it("no skills in prompt → undefined", () => {
+		assert.strictEqual(extractSkillsBlock("Just a normal prompt"), undefined);
+		assert.strictEqual(extractSkillsBlock(undefined), undefined);
+		assert.strictEqual(extractSkillsBlock(""), undefined);
+	});
 
-// No skills in prompt
-{
-	assert.strictEqual(extractSkillsBlock("Just a normal prompt"), undefined);
-	assert.strictEqual(extractSkillsBlock(undefined), undefined);
-	assert.strictEqual(extractSkillsBlock(""), undefined);
-}
-
-// Malformed: start marker but no end marker
-{
-	const partial = "The following skills provide specialized instructions for specific tasks.\nBut no closing tag.";
-	assert.strictEqual(extractSkillsBlock(partial), undefined, "should return undefined for incomplete skills block");
-}
-
-console.log("skills tests passed");
+	it("malformed: start marker but no end marker → undefined", () => {
+		const partial = "The following skills provide specialized instructions for specific tasks.\nBut no closing tag.";
+		assert.strictEqual(extractSkillsBlock(partial), undefined);
+	});
+});
