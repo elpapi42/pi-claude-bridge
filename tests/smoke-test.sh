@@ -6,6 +6,9 @@
 set -euo pipefail
 echo "=== smoke-test.sh ==="
 
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+[ -f "$DIR/.env.test" ] && set -a && . "$DIR/.env.test" && set +a
+
 if [ -z "${CLAUDE_BRIDGE_TESTING_ALT_MODEL:-}" ]; then
   echo "ERROR: CLAUDE_BRIDGE_TESTING_ALT_MODEL not set (e.g. MiniMax-M2.7-highspeed)"
   exit 1
@@ -19,7 +22,6 @@ PATH=$(echo "$PATH" | tr ':' '\n' | grep -v node_modules | tr '\n' ':')
 TIMEOUT=60
 PASS=0
 FAIL=0
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOGDIR="$DIR/.test-output"
 mkdir -p "$LOGDIR"
 export CLAUDE_BRIDGE_DEBUG=1

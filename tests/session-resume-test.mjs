@@ -14,17 +14,25 @@
 console.log("=== session-resume-test.mjs ===");
 
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
+
+// Load .env.test if present (for standalone runs outside npm test)
+const DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+try {
+  for (const line of readFileSync(`${DIR}/.env.test`, "utf8").split("\n")) {
+    const m = line.match(/^(\w+)=(.*)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  }
+} catch {}
 
 if (!process.env.CLAUDE_BRIDGE_TESTING_ALT_PROVIDER || !process.env.CLAUDE_BRIDGE_TESTING_ALT_MODEL) {
   console.error("ERROR: CLAUDE_BRIDGE_TESTING_ALT_PROVIDER and CLAUDE_BRIDGE_TESTING_ALT_MODEL must be set (e.g. minimax / MiniMax-M2.7-highspeed)");
   process.exit(1);
 }
 
-const DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LOGDIR = `${DIR}/.test-output`;
 const LOGFILE = `${LOGDIR}/session-resume.log`;
 const DEBUG_LOG = `${LOGDIR}/session-resume-debug.log`;
