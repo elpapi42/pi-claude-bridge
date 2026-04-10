@@ -19,17 +19,17 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOGDIR="$DIR/.test-output"
 LOGFILE="$LOGDIR/cache-test.ndjson"
 mkdir -p "$LOGDIR"
+export CLAUDE_BRIDGE_DEBUG=1
+export CLAUDE_BRIDGE_DEBUG_PATH="$LOGDIR/cache-test-debug.log"
 
 kill_descendants() { pkill -P $$ 2>/dev/null || true; sleep 1; }
 trap kill_descendants EXIT
 
-DEBUG_LOG="$LOGDIR/cache-test-debug.log"
-
 TMPFILE="$LOGDIR/cache-test-scratch.txt"
-rm -f "$TMPFILE" "$DEBUG_LOG"
+rm -f "$TMPFILE" "$CLAUDE_BRIDGE_DEBUG_PATH"
 
 echo "Running 5-turn conversation (text + tool use)..."
-CLAUDE_BRIDGE_DEBUG=1 CLAUDE_BRIDGE_DEBUG_PATH="$DEBUG_LOG" timeout 180 pi --no-session -ne -e "$DIR" \
+timeout 180 pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
   -p "The secret number is 42. Acknowledge briefly." \
@@ -118,11 +118,11 @@ fi
 echo ""
 echo "Session sync cases:"
 
-CASE1_COUNT=$(grep -c "Case 1:" "$DEBUG_LOG" 2>/dev/null || true)
+CASE1_COUNT=$(grep -c "Case 1:" "$CLAUDE_BRIDGE_DEBUG_PATH" 2>/dev/null || true)
 CASE1_COUNT=${CASE1_COUNT:-0}
-CASE3_COUNT=$(grep -c "Case 3:" "$DEBUG_LOG" 2>/dev/null || true)
+CASE3_COUNT=$(grep -c "Case 3:" "$CLAUDE_BRIDGE_DEBUG_PATH" 2>/dev/null || true)
 CASE3_COUNT=${CASE3_COUNT:-0}
-CASE4_COUNT=$(grep -c "Case 4:" "$DEBUG_LOG" 2>/dev/null || true)
+CASE4_COUNT=$(grep -c "Case 4:" "$CLAUDE_BRIDGE_DEBUG_PATH" 2>/dev/null || true)
 CASE4_COUNT=${CASE4_COUNT:-0}
 echo "  Case 1 (clean start): $CASE1_COUNT"
 echo "  Case 3 (resume):      $CASE3_COUNT"
@@ -152,6 +152,6 @@ if [ "$FAIL" -eq 0 ]; then
 else
   echo "FAIL: $FAIL assertions failed"
   echo "  Log: $LOGFILE"
-  echo "  Debug: $DEBUG_LOG"
+  echo "  Debug: $CLAUDE_BRIDGE_DEBUG_PATH"
   exit 1
 fi

@@ -19,6 +19,8 @@ PATH=$(echo "$PATH" | tr ':' '\n' | grep -v node_modules | tr '\n' ':')
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOGDIR="$DIR/.test-output"
 mkdir -p "$LOGDIR"
+export CLAUDE_BRIDGE_DEBUG=1
+export CLAUDE_BRIDGE_DEBUG_PATH="$LOGDIR/usage-test-debug.log"
 
 MODEL="${1:-claude-haiku-4-5}"
 NUM_TURNS="${2:-10}"

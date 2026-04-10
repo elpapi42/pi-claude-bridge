@@ -19,6 +19,8 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EXPECTED_VERSION=$(jq -r .version "$DIR/package.json")
 LOGDIR="$DIR/.test-output"
 mkdir -p "$LOGDIR"
+export CLAUDE_BRIDGE_DEBUG=1
+export CLAUDE_BRIDGE_DEBUG_PATH="$LOGDIR/multi-turn-debug.log"
 
 kill_descendants() {
   pkill -P $$ 2>/dev/null || true

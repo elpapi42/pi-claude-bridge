@@ -22,6 +22,8 @@ FAIL=0
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOGDIR="$DIR/.test-output"
 mkdir -p "$LOGDIR"
+export CLAUDE_BRIDGE_DEBUG=1
+export CLAUDE_BRIDGE_DEBUG_PATH="$LOGDIR/smoke-test-debug.log"
 
 # Kill child processes spawned by pi (Agent SDK, node, etc.) that outlive the test.
 kill_descendants() {

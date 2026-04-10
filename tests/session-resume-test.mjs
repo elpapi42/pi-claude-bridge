@@ -27,6 +27,7 @@ if (!process.env.CLAUDE_BRIDGE_TESTING_ALT_PROVIDER || !process.env.CLAUDE_BRIDG
 const DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LOGDIR = `${DIR}/.test-output`;
 const LOGFILE = `${LOGDIR}/session-resume.log`;
+const DEBUG_LOG = `${LOGDIR}/session-resume-debug.log`;
 const TIMEOUT = 180_000;
 
 const BRIDGE_MODEL = "claude-bridge/claude-haiku-4-5";
@@ -53,7 +54,7 @@ const pi = spawn("pi", [
   "-e", DIR,
   "--model", `${OTHER_PROVIDER}/${OTHER_MODEL}`,
   "--mode", "rpc",
-], { stdio: ["pipe", "pipe", "pipe"] });
+], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CLAUDE_BRIDGE_DEBUG: "1", CLAUDE_BRIDGE_DEBUG_PATH: DEBUG_LOG } });
 
 pi.stderr.on("data", (d) => log.write(d));
 
