@@ -67,14 +67,6 @@ run "tool: AskClaude responds" \
     -p 'Use the AskClaude tool with prompt=\"What is 2+2? Reply with just the number.\" and then tell me the answer.' 2>&1 \
     | grep -q '\"toolName\":\"AskClaude\"' && echo ok"
 
-# AskClaude background: tool should return immediately with a background task ID.
-# We tell Claude to sleep 100s so the background task can't possibly finish before
-# the tool returns — if the tool blocks, the 30s timeout will kill it.
-run "tool: AskClaude background returns immediately" \
-  bash -c "timeout 30 pi --no-session -ne -e '$DIR' --model '$ALT_MODEL' --mode json \
-    -p 'Use the AskClaude tool with background=true and prompt=\"Run the bash command: sleep 100\". Then say DONE.' 2>&1 \
-    | grep -q 'Background task' && echo ok"
-
 # --- Summary ---
 
 echo ""

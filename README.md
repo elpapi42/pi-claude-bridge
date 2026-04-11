@@ -51,7 +51,6 @@ You could also create skills or add something to AGENTS.md to e.g. "Always call 
 - **`model`** — `opus` (default), `sonnet`, `haiku`, or a full model ID
 - **`thinking`** — effort level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
 - **`isolated`** — when `true`, Claude gets a clean session with no conversation history (default: `false`)
-- **`background`** — when `true`, Claude runs in the background and the result is delivered as a follow-up message when done. Footer shows progress. Use for tasks that don't block your current work (default: `false`)
 
 ## Configuration
 
@@ -62,7 +61,6 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or `.pi/claude-bridge.json` (p
   "askClaude": {
     "enabled": true,
     "allowFullMode": true,
-    "defaultBackground": false,
     "defaultIsolated": false,
     "description": "Custom tool description override"
   }
