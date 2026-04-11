@@ -48,11 +48,6 @@
 
 ## Testing Gaps
 
-- **maxHistoryMessages capping + tool pairing**: `convertAndImportMessages` caps
-  history to `maxHistoryMessages` by slicing from the end. If the slice boundary
-  falls mid-tool-sequence, an orphaned `tool_use` or `tool_result` block could
-  produce an invalid API request. Needs a test and possibly boundary-aware slicing.
-
 - **Structured diagnostics for tests**: Tests currently grep freeform debug log
   strings (e.g. 'Case 1/2/3/4') to verify internal state. Emit these as
   structured NDJSON events or dedicated diagLog entries so tests can query

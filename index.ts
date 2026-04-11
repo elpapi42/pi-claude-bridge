@@ -381,7 +381,90 @@ function convertAndImportMessages(
 		debug(`convertAndImportMessages: sanitized ${sanitizedIds.size} tool IDs:`,
 			[...sanitizedIds.entries()].map(([orig, clean]) => orig === clean ? orig : `${orig}→${clean}`).join(", "));
 	}
-	if (anthropicMessages.length) session.importMessages(anthropicMessages as any);
+	const repaired = repairToolPairing(anthropicMessages);
+	if (repaired.length !== anthropicMessages.length) {
+		debug(`convertAndImportMessages: repairToolPairing ${anthropicMessages.length} → ${repaired.length} msgs`);
+	}
+	if (repaired.length) session.importMessages(repaired as any);
+}
+
+// Repairs orphaned tool_use/tool_result pairs before handing history to
+// cc-session-io. Handles (1) leading tool_result with no preceding assistant
+// (history starts mid-turn, e.g. after a provider switch or Case-4 sync), and
+// (2) assistant tool_use with no matching tool_result in the following user
+// message. Ports the adjacency repairs from claude-code's ensureToolResultPairing.
+function repairToolPairing(
+	messages: Array<{ role: string; content: unknown }>,
+): Array<{ role: string; content: unknown }> {
+	const result: Array<{ role: string; content: unknown }> = [];
+	let pending: Set<string> | null = null; // tool_use ids from preceding assistant
+
+	const synthetic = (id: string) => ({
+		type: "tool_result",
+		tool_use_id: id,
+		content: "[no tool result recorded]",
+		is_error: true,
+	});
+	const flushPending = () => {
+		if (pending && pending.size > 0) {
+			result.push({ role: "user", content: [...pending].map(synthetic) });
+		}
+		pending = null;
+	};
+
+	for (const msg of messages) {
+		if (msg.role === "assistant") {
+			flushPending();
+			const ids = new Set<string>();
+			if (Array.isArray(msg.content)) {
+				for (const b of msg.content as any[]) {
+					if (b?.type === "tool_use" && typeof b.id === "string") ids.add(b.id);
+				}
+			}
+			result.push(msg);
+			pending = ids.size > 0 ? ids : null;
+			continue;
+		}
+
+		// user message
+		const blocks = Array.isArray(msg.content) ? (msg.content as any[]) : null;
+		const hasToolResults = blocks?.some((b) => b?.type === "tool_result") ?? false;
+
+		// Fast path: nothing to repair — preserve original shape
+		if (!pending && !hasToolResults) {
+			result.push(msg);
+			continue;
+		}
+
+		const input = blocks
+			?? (typeof msg.content === "string" && msg.content ? [{ type: "text", text: msg.content }] : []);
+		const provided = new Set<string>();
+		const kept = input.filter((b) => {
+			if (b?.type !== "tool_result") return true;
+			if (pending?.has(b.tool_use_id)) {
+				provided.add(b.tool_use_id);
+				return true;
+			}
+			return false; // orphan: drop
+		});
+		if (pending) {
+			const missing = [...pending].filter((id) => !provided.has(id)).map(synthetic);
+			kept.unshift(...missing);
+			pending = null;
+		}
+		if (kept.length === 0) {
+			// Only insert a placeholder if this would otherwise leave the payload
+			// with no leading user message (API rejects payloads not starting with user).
+			if (result.length === 0) {
+				result.push({ role: "user", content: [{ type: "text", text: "[orphaned tool result removed]" }] });
+			}
+			continue;
+		}
+		result.push({ ...msg, content: kept });
+	}
+
+	flushPending();
+	return result;
 }
 
 type McpContent = Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
