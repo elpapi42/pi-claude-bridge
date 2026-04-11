@@ -8,7 +8,7 @@ import { pascalCase } from "change-case";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { createSession } from "cc-session-io";
-import { appendFileSync, existsSync, readFileSync, realpathSync, statSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, resolve } from "path";
 
@@ -39,6 +39,32 @@ function debug(...args: unknown[]) {
 	};
 	const msg = args.map(fmt).join(" ");
 	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
+}
+
+// Per-query CLI debug capture. When CLAUDE_BRIDGE_DEBUG=1, ask the Claude Code
+// CLI subprocess to write its own debug log to a file we choose, and also
+// forward its stderr into our debug stream. Drops straight into the real SDK's
+// Options — see @anthropic-ai/claude-agent-sdk sdk.d.ts:1245 (debug, debugFile,
+// stderr). Without this, CC's internal view of the world is invisible to us
+// and "No conversation found" / empty-error reports are unactionable.
+let nextCliDebugSeq = 1;
+function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string; stderr?: (data: string) => void } {
+	if (!DEBUG) return {};
+	const seq = nextCliDebugSeq++;
+	const ts = new Date().toISOString().replace(/[:.]/g, "-");
+	const logDir = join(dirname(DEBUG_LOG_PATH), "cc-cli-logs");
+	try { mkdirSync(logDir, { recursive: true }); } catch { /* ignore */ }
+	const debugFile = join(logDir, `${ts}-${tag}-${seq}.log`);
+	debug(`cli-debug: ${tag} #${seq} → ${debugFile}`);
+	return {
+		debug: true,
+		debugFile,
+		stderr: (data: string) => {
+			for (const line of data.split(/\r?\n/)) {
+				if (line) debug(`[cli-stderr ${tag}#${seq}] ${line}`);
+			}
+		},
+	};
 }
 
 /** Unconditional diagnostic dump — for "should never happen" paths */
@@ -1439,6 +1465,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...(settingSources ? { settingSources } : {}),
 		...(mcpServers ? { mcpServers } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
+		...makeCliDebugOptions("provider"),
 	};
 
 	debug("provider: fresh query",
@@ -1518,7 +1545,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					break;
 				}
 
-				const contOptions = { ...queryOptions, resume: resumeId };
+				const contOptions = { ...queryOptions, resume: resumeId, ...makeCliDebugOptions("continuation") };
 				const contQuery = query({ prompt: steerPrompt, options: contOptions });
 				activeQuery = contQuery;
 
@@ -1656,6 +1683,7 @@ async function promptAndWait(
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),
+			...makeCliDebugOptions("askclaude"),
 		},
 	});
 
