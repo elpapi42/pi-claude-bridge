@@ -61,10 +61,35 @@
   (we only need the cc-session-io one for seeding resume). Currently sessions
   accumulate indefinitely with no cleanup or reuse.
 
-- **Case 4 session reuse**: `syncSharedSession` Case 4 creates a fresh session
-  every time there are missed messages (e.g., user switched providers mid-conversation).
-  Ideally we'd overwrite the existing JSONL with new contents under the same session
-  ID, but cc-session-io's API is append-only with auto-generated UUIDs. Would need
-  either a `clear()` method upstream or manual file deletion + reconstruction.
-  Low priority — the cleanup task above is more impactful.
+- **Post-abort rebuild rotates sessionId** (see `Case 4 post-abort` log line).
+  Normal Case 4 rebuilds preserve the sessionId by wiping the file in place
+  (`deleteSession` + `createSession({sessionId})`). The post-abort path can't
+  safely do that: the killed CC subprocess flushes a late `[Request interrupted
+  by user]` record during its own cleanup, and if that write lands on the
+  freshly-rewritten file it appends an orphan record with a dangling
+  `parentUuid`, which breaks CC's parent-uuid chain on the next resume — CC
+  silently starts with an empty context and produces a confidently-wrong
+  answer. Diagnosed in debug log during branch work, see commit e317461.
+
+  Current fix: post-abort rebuild takes a fresh UUID, so the orphan writes can
+  only land on a dead inode. Deterministic, zero-latency, costs one extra UUID
+  in the debug log per abort.
+
+  Options to revisit:
+  - **Short delay (~500ms) before post-abort rebuild**, keep the UUID stable.
+    Overprovisions the observed ~1–2ms race window by 250–500×. Adds visible
+    latency on the post-abort turn. Eli's lean: 500ms feels like plenty and
+    the UX is fine. Risk: still probabilistic — loaded systems could extend
+    subprocess cleanup past the delay and we'd never know until a user hits
+    the silent context-loss path.
+  - **Drain the aborted query's AsyncGenerator to completion** before
+    rebuilding. Iterate `for await (_ of sdkQuery) {}` in the catch handler
+    until the generator ends (i.e. subprocess stdout fully closed). Race-free
+    and latency-free, but the control flow acrobatics around the SDK's Query
+    wrapper are non-obvious — need to confirm re-entering iteration after
+    abort is legal, and that stdout close happens strictly after the orphan
+    write flushes.
+  - **Listen for the ChildProcess `exit` event directly.** Official SDK Query
+    interface doesn't expose the child, so this needs either a fork or a
+    hacky property access. Rejected unless the SDK grows a hook.
 
