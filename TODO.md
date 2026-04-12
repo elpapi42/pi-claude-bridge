@@ -82,14 +82,23 @@
     the UX is fine. Risk: still probabilistic — loaded systems could extend
     subprocess cleanup past the delay and we'd never know until a user hits
     the silent context-loss path.
-  - **Drain the aborted query's AsyncGenerator to completion** before
-    rebuilding. Iterate `for await (_ of sdkQuery) {}` in the catch handler
-    until the generator ends (i.e. subprocess stdout fully closed). Race-free
-    and latency-free, but the control flow acrobatics around the SDK's Query
-    wrapper are non-obvious — need to confirm re-entering iteration after
-    abort is legal, and that stdout close happens strictly after the orphan
-    write flushes.
-  - **Listen for the ChildProcess `exit` event directly.** Official SDK Query
-    interface doesn't expose the child, so this needs either a fork or a
-    hacky property access. Rejected unless the SDK grows a hook.
+  - **Drain the aborted query's AsyncGenerator to completion**, then rebuild.
+    Investigated in detail. The real SDK's Query class (`lX`) delegates its
+    iterator protocol (`next`/`return`/`throw`/`[Symbol.asyncIterator]`) to
+    a native async generator. Draining the generator only observes messages
+    CC has emitted via stream — it says nothing about pending `fs.appendFile`
+    calls CC has queued in its event loop for the session JSONL. CC can emit
+    the orphan marker's stream message, pi's drain sees it and returns, pi
+    rebuilds, and CC's *still-pending* file write lands on the fresh inode.
+    Drain narrows the race window but doesn't close it. Also requires making
+    `syncSharedSession` async and restructuring `streamClaudeAgentSdk`'s
+    kickoff path to await a pending drain promise — 4+ pieces of added state
+    for a still-probabilistic fix. Strictly worse than rotation.
+  - **Listen for the ChildProcess `exit` event directly.** This is the only
+    deterministic fix (open-claude-agent-sdk does exactly this in its
+    `gracefulClose()` via `proc.on('exit', ...)`). Official SDK's Query
+    interface doesn't expose the child process — would need to either fork
+    the SDK or reach into private state. Rejected unless the SDK grows a
+    `close({ graceful: true })` or equivalent hook that awaits subprocess
+    exit.
 
