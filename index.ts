@@ -1551,7 +1551,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
-		systemPrompt: {
+		systemPrompt: context.systemPrompt ?? {
 			type: "preset", preset: "claude_code",
 			append: systemPromptAppend ? systemPromptAppend : undefined,
 		},
